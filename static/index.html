@@ -58,6 +58,9 @@
   .fld input:focus,.fld select:focus,.fld textarea:focus{border-color:#fff;box-shadow:none}
   .fld textarea{display:block;min-height:82px;resize:vertical;line-height:1.6}
   .fld .row{display:flex;gap:8px}.fld .row>div{flex:1;min-width:0}
+  .config-toggle{width:100%;display:flex;align-items:center;justify-content:space-between;padding:7px 9px;text-align:left;font:12px var(--mono)}
+  .config-toggle::after{content:attr(data-state);color:var(--ink-faint)}
+  .config-toggle.on::after{color:#000}
   .config-actions{flex:none;display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:10px 12px;border-top:1px solid var(--line-2);background:#050505}
   .config-actions button{font-size:12px}
 
@@ -93,10 +96,12 @@
   .file .retry:hover:not(:disabled){border-color:#fff;background:#fff;color:#000}.file .retry svg{width:14px;height:14px}
   .file .retry.queued{color:#fff;border-color:#fff;background:#222}
   .file-actions{display:flex;align-items:center;justify-content:flex-end;gap:2px}
+  .file .retranslate-file{width:26px;height:26px;padding:5px;display:inline-flex;align-items:center;justify-content:center;color:var(--ink-soft);background:transparent;border-color:transparent}
+  .file .retranslate-file:hover:not(:disabled){border-color:#fff;background:#fff;color:#000}.file .retranslate-file svg{width:14px;height:14px}
   .file .delete{width:26px;height:26px;padding:5px;display:inline-flex;align-items:center;justify-content:center;color:var(--ink-faint);background:transparent;border-color:transparent}
   .file .delete:hover:not(:disabled){border-color:#fff;background:#fff;color:#000}.file .delete svg{width:14px;height:14px}
-  .file.selected .delete,.file.selected .retry,.file.selected .dl{color:#000}
-  .file.selected .delete:hover:not(:disabled),.file.selected .retry:hover:not(:disabled){border-color:#000;background:#000;color:#fff}
+  .file.selected .delete,.file.selected .retry,.file.selected .retranslate-file,.file.selected .dl{color:#000}
+  .file.selected .delete:hover:not(:disabled),.file.selected .retry:hover:not(:disabled),.file.selected .retranslate-file:hover:not(:disabled){border-color:#000;background:#000;color:#fff}
   .queue-foot{flex:none;padding:8px 12px;border-top:1px solid var(--line-2);color:var(--ink-faint);font:10px var(--mono);background:#050505}
 
   .detail-panel{display:flex;flex-direction:column;background:var(--paper)}
@@ -109,14 +114,30 @@
   .split{height:100%;overflow:auto;border:0;border-radius:0;background:#000;scrollbar-gutter:stable}
   .compare-splitter{position:absolute;z-index:4;top:0;bottom:0;left:var(--source-w);width:6px;transform:translateX(-3px);cursor:col-resize;touch-action:none;will-change:transform;background:#333;border-left:1px solid #555;border-right:1px solid #555;transition:background .1s linear}
   .compare-splitter:hover,.compare-splitter.dragging{background:#fff;border-color:#fff}
-  .shead{position:sticky;top:0;z-index:2;display:grid;grid-template-columns:var(--source-w) minmax(0,1fr);background:#0b0b0b;border-bottom:1px solid var(--line-2);color:var(--ink-soft);font:10px var(--mono);letter-spacing:.14em}
-  .shead span{padding:9px 12px}.shead span:last-child{border-left:1px solid var(--line)}
-  .srow{display:grid;grid-template-columns:var(--source-w) minmax(0,1fr);border-bottom:1px solid #1e1e1e}
+  .shead{position:sticky;top:0;z-index:2;display:grid;grid-template-columns:var(--source-w) minmax(0,1fr) 42px;background:#0b0b0b;border-bottom:1px solid var(--line-2);color:var(--ink-soft);font:10px var(--mono);letter-spacing:.14em}
+  .shead span{padding:9px 12px}.shead span:nth-child(n+2){border-left:1px solid var(--line)}.shead .line-action-head{padding:9px 0;text-align:center;letter-spacing:0}
+  .srow{display:grid;grid-template-columns:var(--source-w) minmax(0,1fr) 42px;border-bottom:1px solid #1e1e1e}
   .srow:last-child{border-bottom:0}.srow:nth-child(odd){background:#070707}
   .srow .scell,.srow .dcell{min-width:0;padding:10px 12px;font-size:12px;line-height:1.75;white-space:pre-wrap;word-break:break-word}
   .srow .scell{color:#a8a8a8}.srow .dcell{border-left:1px solid var(--line);color:#fff}
   .srow .empty{color:var(--ink-faint);font-style:italic}
+  .line-action-cell{display:flex;align-items:center;justify-content:center;border-left:1px solid var(--line);background:#050505}
+  .line-retranslate,.line-save{width:28px;height:28px;padding:6px;display:inline-flex;align-items:center;justify-content:center;border-color:transparent;background:transparent;color:var(--ink-soft)}
+  .line-retranslate:hover:not(:disabled),.line-save:hover:not(:disabled){border-color:#fff;background:#fff;color:#000}.line-retranslate svg,.line-save svg{width:15px;height:15px}
+  .line-retranslate.busy svg{animation:spin .8s linear infinite}
+  .dcell[contenteditable="true"]{background:#fff!important;color:#000!important;outline:0;box-shadow:inset 0 0 0 1px #fff;cursor:text}
+  .dcell[data-editable="true"]{cursor:text}.dcell[data-editable="true"]:hover{background:#101010}
+  @keyframes spin{to{transform:rotate(360deg)}}
   .empty{padding:28px 10px;text-align:center;color:var(--ink-faint);font-size:12px}
+  .app-modal{position:fixed;inset:0;z-index:1000;display:grid;place-items:center;padding:24px;background:rgba(0,0,0,.76)}
+  .app-modal[hidden]{display:none}
+  .app-modal-box{width:min(520px,calc(100vw - 48px));border:1px solid #fff;background:#050505;color:#fff;box-shadow:12px 12px 0 #1d1d1d}
+  .app-modal-head{padding:13px 16px;border-bottom:1px solid #555;font-size:13px;font-weight:700;letter-spacing:.08em}
+  .app-modal-message{min-height:78px;padding:18px 16px;white-space:pre-wrap;overflow-wrap:anywhere;color:#d0d0d0;line-height:1.7}
+  .app-modal-actions{display:flex;justify-content:flex-end;flex-wrap:wrap;gap:8px;padding:12px 16px;border-top:1px solid #333}
+  .app-modal-actions button{min-width:92px}
+  .app-modal-actions button.modal-danger{border-color:#fff;background:#fff;color:#000;font-weight:700}
+  .app-modal-actions button.modal-danger:hover:not(:disabled){background:#bfbfbf;border-color:#bfbfbf}
 </style>
 </head>
 <body>
@@ -142,7 +163,7 @@
       <div class="fld"><label>API 密钥</label>
         <input id="cfg_key" type="password" autocomplete="off" placeholder="未启用鉴权时留空"></div>
       <div class="fld"><label>模型名</label>
-        <input id="cfg_model" placeholder="hy-mt1.5-1.8b"></div>
+        <input id="cfg_model" placeholder="hy-mt2-7b"></div>
       <div class="fld"><label>上下文长度</label>
         <input id="cfg_ctx" type="number" min="2048" step="1024" value="65536"></div>
     </div>
@@ -157,6 +178,8 @@
         <div><label>top_p</label><input id="cfg_topp" type="number" step="0.05" value="0.6"></div>
         <div><label>repeat_penalty</label><input id="cfg_rp" type="number" step="0.05" value="1.05"></div>
       </div></div>
+      <div class="fld"><label>推理控制</label>
+        <button id="cfg_thinking" class="config-toggle" type="button" data-enabled="false" data-state="关闭" aria-pressed="false">思考模式</button></div>
     </div>
 
     <div class="sec">
@@ -272,6 +295,14 @@
   </section>
 </main>
 
+<div class="app-modal" id="appModal" role="dialog" aria-modal="true" aria-labelledby="appModalTitle" hidden>
+  <div class="app-modal-box">
+    <div class="app-modal-head" id="appModalTitle">提示</div>
+    <div class="app-modal-message" id="appModalMessage"></div>
+    <div class="app-modal-actions" id="appModalActions"></div>
+  </div>
+</div>
+
 <script>
 const $ = id => document.getElementById(id);
 let files = [];       // {name, content, status, error, content_out, live_out, legacy_out, output_name}
@@ -280,8 +311,62 @@ let jobNames = [], interrupted = false;
 let selectedIdx = -1, currentName = '', trackingProgress = false;
 let compareRatio = 50;
 let pollBusy = false;
+let lineRetranslating = null;
+let lineEditing = null, lineSaving = false;
 let taskListScrollTop = 0;
+let streamScrollFrame = 0;
+let modalResolve = null, modalCancelValue = null;
 $('list').addEventListener('scroll', () => { taskListScrollTop = $('list').scrollTop; }, {passive:true});
+
+function closeAppModal(value){
+  const modal=$('appModal');
+  modal.hidden=true;
+  const resolve=modalResolve;
+  modalResolve=null; modalCancelValue=null;
+  if(resolve) resolve(value);
+}
+
+function appModal({title='提示',message='',actions=[],cancelValue=null}){
+  if(modalResolve) closeAppModal(modalCancelValue);
+  $('appModalTitle').textContent=title;
+  $('appModalMessage').textContent=message;
+  const actionBox=$('appModalActions');
+  actionBox.innerHTML='';
+  modalCancelValue=cancelValue;
+  return new Promise(resolve => {
+    modalResolve=resolve;
+    actions.forEach(action => {
+      const button=document.createElement('button');
+      button.textContent=action.label;
+      button.className=action.kind==='danger' ? 'modal-danger' : (action.kind==='primary' ? 'primary' : '');
+      button.disabled=!!action.disabled;
+      button.onclick=()=>closeAppModal(action.value);
+      actionBox.appendChild(button);
+      if(action.focus) requestAnimationFrame(()=>button.focus());
+    });
+    $('appModal').hidden=false;
+  });
+}
+
+function appAlert(message,title='提示'){
+  return appModal({title,message,actions:[{label:'知道了',value:true,kind:'primary',focus:true}],cancelValue:true});
+}
+
+function appConfirm(message,title='确认'){
+  return appModal({title,message,actions:[
+    {label:'取消',value:false,focus:true},
+    {label:'确认',value:true,kind:'primary'}
+  ],cancelValue:false});
+}
+
+$('appModal').addEventListener('pointerdown',event => {
+  if(event.target===$('appModal')) closeAppModal(modalCancelValue);
+});
+document.addEventListener('keydown',event => {
+  if(event.key==='Escape' && !$('appModal').hidden){
+    event.preventDefault(); closeAppModal(modalCancelValue);
+  }
+});
 function updateTotalProgress(done=0, total=0){
   const pct = total ? Math.round(done/total*100) : 0;
   $('bar').firstElementChild.style.width = pct + '%';
@@ -341,24 +426,51 @@ const LEGACY_SYSTEM_PROMPTS = [
 4. 原样保留 URL、行内代码、变量、占位符、数字及 Markdown 行内标记。`
 ];
 const CFG_DEFAULTS = {
-  server:'http://127.0.0.1:8081', key:'', model:'hy-mt1.5-1.8b', ctx:65536,
+  server:'http://127.0.0.1:8081', key:'local-qwen', model:'hy-mt2-7b', ctx:65536,
   temp:0.7, topk:20, topp:0.6, rp:1.05, src:'自动判断', tgt:'中文', style:'自动判断', bp:15, cc:12000,
   contextChars:4000, futureContextChars:2000,
-  sys:''
+  thinking:false, sys:''
 };
+function setThinkingMode(enabled){
+  const button=$('cfg_thinking');
+  const on=enabled===true || enabled==='true';
+  button.dataset.enabled=String(on);
+  button.dataset.state=on ? '开启' : '关闭';
+  button.classList.toggle('on',on);
+  button.setAttribute('aria-pressed',String(on));
+  button.title=on ? '模型会先进行推理，翻译通常不需要' : '直接生成译文，翻译推荐';
+}
 function readCfg(){
   const c = {};
   for(const k in CFG_FIELDS) c[k] = $(CFG_FIELDS[k]).value;
+  c.thinking=$('cfg_thinking').dataset.enabled==='true';
   return c;
 }
+function requestConfig(){
+  const cfg = readCfg();
+  return {
+    server:cfg.server, api_key:cfg.key, model:cfg.model, context_size:+cfg.ctx,
+    temperature:+cfg.temp, top_k:+cfg.topk, top_p:+cfg.topp, repeat_penalty:+cfg.rp,
+    batch_paras:+cfg.bp, chunk_chars:+cfg.cc, context_chars:+cfg.contextChars,
+    future_context_chars:+cfg.futureContextChars, src_lang:cfg.src, tgt_lang:cfg.tgt,
+    translation_style:cfg.style, system_prompt:cfg.sys,
+    enable_thinking:!!cfg.thinking
+  };
+}
 function writeCfg(c){
+  c=c||{};
   for(const k in CFG_FIELDS) $(CFG_FIELDS[k]).value = c[k] ?? CFG_DEFAULTS[k];
+  setThinkingMode(c.thinking ?? CFG_DEFAULTS.thinking);
 }
 try{
   const savedCfg = JSON.parse(localStorage.getItem('bench_cfg'));
   if(savedCfg){
     if(Number(savedCfg.ctx) === 131072) savedCfg.ctx = 65536;
     if(Number(savedCfg.cc) === 8000) savedCfg.cc = 12000;
+    // 将旧版默认模型切换到 Hy-MT2 7B；用户自行填写的其他模型名保持不变。
+    if(String(savedCfg.model || '').toLowerCase() === 'hy-mt1.5-1.8b'){
+      savedCfg.model = 'hy-mt2-7b';
+    }
     // v3 将系统硬性规则彻底移入后端。首次加载新版时无条件清掉旧输入框内容，
     // 避免旧提示词因换行、空格或字符差异被误当成用户补充要求；此后新填写的内容正常保留。
     if(localStorage.getItem('bench_prompt_migration') !== '3'){
@@ -470,8 +582,13 @@ $('drop').addEventListener('drop', e => addFiles([...e.dataTransfer.files]));
 
 async function addFiles(list){
   for(const f of list){
-    if(files.some(x => x.name === f.name)) continue;
     const content = await f.text();
+    const existing = files.find(x => x.name === f.name);
+    if(existing){
+      // 刷新恢复或接口提交的任务可能只有文件名；重新添加时补回原文。
+      if(typeof existing.content !== 'string') existing.content = content;
+      continue;
+    }
     files.push({name:f.name, content, status:'q', error:'', content_out:null,
       live_out:{}, legacy_out:'', output_name:null, target_language:null, priority:false, retry_queued:false});
   }
@@ -485,6 +602,37 @@ $('btnClear').addEventListener('click', () => { files=[]; selectedIdx=-1; render
 function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 function escAttr(s){ return esc(s).replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
 
+function sourceLineInfo(lines){
+  let inFence=false;
+  return lines.map(rawLine => {
+    // File.text() 会保留 Windows CRLF 中的 \r；先去掉物理行尾，避免正则匹配失败。
+    const line=String(rawLine).replace(/\r$/,'');
+    if(/^(\s*)(```|~~~)/.test(line)){ inFence=!inFence; return {translate:false,prefix:'',suffix:''}; }
+    if(inFence || !line.trim() || /^(?: {4}|\t)/.test(line)) return {translate:false,prefix:'',suffix:''};
+    if(/^\s{0,3}(?:(?:\*\s*){3,}|(?:-\s*){3,}|(?:_\s*){3,})$/.test(line)) return {translate:false,prefix:'',suffix:''};
+    const patterns = [
+      /^(\s{0,3}#{1,6}[ \t]+)(.*?)([ \t]*)$/,
+      /^(\s*(?:>\s*)*(?:[-+*]|\d+[.)])\s+\[[ xX]\]\s+)(.*?)([ \t]*)$/,
+      /^(\s*(?:>\s*)*(?:[-+*]|\d+[.)])\s+)(.*?)([ \t]*)$/,
+      /^(\s*(?:>\s*)+)(.*?)([ \t]*)$/,
+    ];
+    for(const pattern of patterns){
+      const match=line.match(pattern);
+      if(match) return {translate:!!match[2],prefix:match[1],suffix:match[3]};
+    }
+    const plain=line.match(/^(\s*)(.*?)([ \t]*)$/);
+    if(!plain) return {translate:false,prefix:'',suffix:''};
+    return {translate:!!plain[2],prefix:plain[1],suffix:plain[3]};
+  });
+}
+
+function translatedLineBody(info, translatedLine){
+  let text=String(translatedLine||'');
+  if(info.prefix && text.startsWith(info.prefix)) text=text.slice(info.prefix.length);
+  if(info.suffix && text.endsWith(info.suffix)) text=text.slice(0,-info.suffix.length);
+  return text;
+}
+
 function splitHtml(i){
   const f = files[i];
   if(!f) return '';
@@ -493,6 +641,7 @@ function splitHtml(i){
   const completed = f.content_out !== null;
   const dst = completed ? String(f.content_out).split('\n') : [];
   const live = f.live_out || {};
+  const lineInfo = sourceLineInfo(src);
   // 兼容修复前已在运行的后端：旧 chunk 没有物理行号，按非空行顺序对齐。
   const legacy = {};
   if(!completed && !Object.keys(live).length && f.legacy_out){
@@ -502,7 +651,7 @@ function splitHtml(i){
       legacy[targetRow] = line;
     });
   }
-  let rows = '<div class="shead"><span>原文</span><span>译文</span></div>';
+  let rows = '<div class="shead"><span>原文</span><span>译文</span><span class="line-action-head">重译</span></div>';
   const n = Math.max(src.length, dst.length,
     ...Object.keys(live).map(Number).map(x=>x+1),
     ...Object.keys(legacy).map(Number).map(x=>x+1), 0);
@@ -510,7 +659,15 @@ function splitHtml(i){
     const s = src[k] || '';
     const d = completed ? (dst[k] || '') : (live[k] || legacy[k] || '');
     if(!s.trim() && !d.trim()) continue;
-    rows += `<div class="srow" data-line="${k}"><div class="scell${s?'':' empty'}">${esc(s)||'…'}</div><div class="dcell${d?'':' empty'}">${esc(d)||'…'}</div></div>`;
+    const isBusy = lineRetranslating && lineRetranslating.name===f.name && lineRetranslating.line===k;
+    const lineButton = completed && lineInfo[k]?.translate
+      ? `<button class="line-retranslate${isBusy?' busy':''}" data-line="${k}" title="重新翻译这一行" aria-label="重新翻译第 ${k+1} 行" ${jobId||submitting||lineRetranslating||lineSaving||lineEditing?'disabled':''}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6v5h-5"/><path d="M18.2 15a7 7 0 1 1-.7-7.8L20 11"/></svg></button>`
+      : '';
+    const saveButton = completed && lineInfo[k]?.translate
+      ? `<button class="line-save" data-line="${k}" title="保存这一行" aria-label="保存第 ${k+1} 行" hidden><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m5 12 4 4L19 6"/></svg></button>`
+      : '';
+    const editable = completed && lineInfo[k]?.translate ? ' data-editable="true" title="双击编辑译文"' : '';
+    rows += `<div class="srow" data-line="${k}"><div class="scell${s?'':' empty'}">${esc(s)||'…'}</div><div class="dcell${d?'':' empty'}"${editable}>${esc(d)||'…'}</div><div class="line-action-cell">${lineButton}${saveButton}</div></div>`;
   }
   return rows;
 }
@@ -522,14 +679,15 @@ function render(){
   const runnable = unfinishedFiles();
   const failedRunnable = runnable.filter(f => f.status === 'err');
   const runnableSet = new Set(runnable);
-  $('btnGo').disabled = files.length === 0 || submitting || (jobId !== null) || runnable.length === 0;
+  $('btnGo').disabled = files.length === 0 || submitting || !!lineRetranslating || lineSaving || !!lineEditing || (jobId !== null) || runnable.length === 0;
   $('btnGo').textContent = submitting ? '正在启动' : (jobId ? '翻译中'
     : (failedRunnable.length === runnable.length && failedRunnable.length
       ? `重试失败（${failedRunnable.length}）`
       : (failedRunnable.length ? `继续并重试（${runnable.length}）` : '开始翻译')));
   $('btnStop').hidden = !jobId;
   $('btnZip').hidden = !lastJob;
-  $('btnClear').disabled = files.length === 0 || !!jobId;
+  $('btnZip').disabled = !lastJob || !!lineRetranslating || lineSaving || !!lineEditing;
+  $('btnClear').disabled = files.length === 0 || !!jobId || !!lineRetranslating || lineSaving || !!lineEditing;
   $('btnTrack').disabled = !jobId || !currentName;
   $('btnTrack').classList.toggle('on', trackingProgress);
   $('btnTrack').textContent = trackingProgress ? '停止跟随' : '跟随翻译进度';
@@ -544,13 +702,16 @@ function render(){
   list.innerHTML = files.map((f,i) => {
     const stMap = {q:['待译','q'], run:['翻译中','run'], ok:['完成','ok'], err:['失败','err']};
     const [label, cls] = stMap[f.status] || ['待译','q'];
-    const dl = f.status==='ok' && f.content_out !== null ? `<button class="dl" data-i="${i}">下载</button>` : '';
+    const dl = f.status==='ok' && f.content_out !== null ? `<button class="dl" data-i="${i}" ${lineRetranslating||lineSaving||lineEditing?'disabled':''}>下载</button>` : '';
     const retryDisabled = typeof f.content !== 'string';
     const retryTitle = retryDisabled ? '原文未保留，请重新添加文件'
       : (jobId ? (f.retry_queued ? '已加入批次结束后的重试队列，点击取消' : '当前批次结束后自动重试') : '重试该文件');
-    const retry = f.status==='err' ? `<button class="retry${f.retry_queued?' queued':''}" data-i="${i}" title="${retryTitle}" aria-label="重试该文件" ${retryDisabled?'disabled':''}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6v5h-5"/><path d="M18.2 15a7 7 0 1 1-.7-7.8L20 11"/></svg></button>` : '';
-    const remove = `<button class="delete" data-i="${i}" title="从任务列表删除" aria-label="删除任务" ${jobId||submitting?'disabled':''}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 10v6M14 10v6"/></svg></button>`;
-    const actions = `<span class="file-actions">${dl}${retry}${remove}</span>`;
+    const retry = f.status==='err' ? `<button class="retry${f.retry_queued?' queued':''}" data-i="${i}" title="${retryTitle}" aria-label="重试该文件" ${retryDisabled||lineRetranslating||lineSaving||lineEditing?'disabled':''}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6v5h-5"/><path d="M18.2 15a7 7 0 1 1-.7-7.8L20 11"/></svg></button>` : '';
+    const wholeRetranslate = f.status==='ok' && f.content_out !== null && typeof f.content==='string'
+      ? `<button class="retranslate-file" data-i="${i}" title="重新翻译整个文件" aria-label="重新翻译整个文件" ${jobId||submitting||lineRetranslating||lineSaving||lineEditing?'disabled':''}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6v5h-5"/><path d="M18.2 15a7 7 0 1 1-.7-7.8L20 11"/></svg></button>`
+      : '';
+    const remove = `<button class="delete" data-i="${i}" title="从任务列表删除" aria-label="删除任务" ${jobId||submitting||lineRetranslating||lineSaving||lineEditing?'disabled':''}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 10v6M14 10v6"/></svg></button>`;
+    const actions = `<span class="file-actions">${dl}${wholeRetranslate}${retry}${remove}</span>`;
     const err = f.error ? `<span class="err">${esc(f.error)}</span>` : '';
     const canPrioritize = runnableSet.has(f) && f.name !== currentName && (!jobId || f.status === 'q');
     const priorityTitle = jobId ? '安排为当前任务的下一个任务' : '移动到队列最前';
@@ -567,6 +728,9 @@ function render(){
   list.querySelectorAll('.dl').forEach(b => b.onclick = e => { e.stopPropagation(); download(b.dataset.i); });
   list.querySelectorAll('.retry').forEach(b => b.onclick = e => {
     e.stopPropagation(); if(!b.disabled) retryFile(+b.dataset.i);
+  });
+  list.querySelectorAll('.retranslate-file').forEach(b => b.onclick = e => {
+    e.stopPropagation(); if(!b.disabled) retranslateFile(+b.dataset.i);
   });
   list.querySelectorAll('.delete').forEach(b => b.onclick = e => {
     e.stopPropagation(); if(!b.disabled) deleteFile(+b.dataset.i);
@@ -614,26 +778,45 @@ function retryFile(i){
   submitJob([f]);
 }
 
-async function deleteFile(i){
-  if(jobId || submitting || i < 0 || i >= files.length) return;
-  const f = files[i];
-  if(!confirm(`确认从任务列表移除“${f.name}”？`)) return;
+async function retranslateFile(i){
+  if(jobId || submitting || lineRetranslating || lineSaving || lineEditing || i < 0 || i >= files.length) return;
+  const f=files[i];
+  if(typeof f.content !== 'string'){
+    await appAlert('原文未保留，请重新添加文件后再重译。','无法重译');
+    return;
+  }
+  if(!await appConfirm(`确认重新翻译整个文件“${f.name}”？\n\n成功后将覆盖磁盘中的现有译文。`,'整篇重译')) return;
+  selectedIdx=i;
+  submitJob([f], {retranslate:true});
+}
 
+async function deleteFile(i){
+  if(jobId || submitting || lineRetranslating || lineSaving || lineEditing || i < 0 || i >= files.length) return;
+  const f = files[i];
   const diskName = f.output_name || (f.content_out !== null
     ? outputName(f.name, f.target_language || $('cfg_tgt').value)
     : '');
-  if(diskName && confirm(
-    `是否同时删除磁盘中的译文“${diskName}”？\n\n确定：删除任务和磁盘译文\n取消：仅从任务列表移除`
-  )){
+  const choice=await appModal({
+    title:'删除任务',
+    message:`请选择如何处理“${f.name}”。${diskName ? `\n\n关联磁盘译文：${diskName}` : '\n\n当前没有可识别的磁盘译文。'}`,
+    actions:[
+      {label:'仅从任务列表移除',value:'list',focus:true},
+      {label:'从任务列表及磁盘删除',value:'disk',kind:'danger',disabled:!diskName},
+      {label:'取消',value:null}
+    ],
+    cancelValue:null
+  });
+  if(!choice) return;
+  if(choice==='disk'){
     try{
       const response = await fetch('/api/output?name=' + encodeURIComponent(diskName), {method:'DELETE'});
       const result = await response.json();
       if(!response.ok || !result.ok){
-        alert('磁盘译文删除失败：' + (result.error || response.status));
+        await appAlert('磁盘译文删除失败：' + (result.error || response.status),'删除失败');
         return;
       }
     }catch(error){
-      alert('磁盘译文删除失败：' + error.message);
+      await appAlert('磁盘译文删除失败：' + error.message,'删除失败');
       return;
     }
   }
@@ -647,8 +830,14 @@ async function deleteFile(i){
   render();
 }
 
-function selectFile(i){
+async function selectFile(i){
   if(i < 0 || i >= files.length) return;
+  if(lineEditing){
+    if(lineEditing.name === files[i].name) return;
+    if(!await appConfirm('当前译文行尚未保存，是否放弃此次编辑？','放弃编辑')) return;
+    lineEditing=null; lineSaving=false;
+    render();
+  }
   const previousIdx = selectedIdx;
   selectedIdx = i;
   if(trackingProgress){
@@ -684,6 +873,142 @@ function renderDetail(){
     <div class="compare-splitter" title="拖动调整原文与译文宽度"></div>
   </div>`;
   setupCompareResize();
+  detail.querySelectorAll('.line-retranslate').forEach(button => {
+    button.onclick = () => { if(!button.disabled) retranslateLine(+button.dataset.line); };
+  });
+  detail.querySelectorAll('.line-save').forEach(button => {
+    button.onclick = () => { if(!button.disabled) saveLineEdit(+button.dataset.line); };
+  });
+  detail.querySelectorAll('.dcell[data-editable="true"]').forEach(cell => {
+    cell.ondblclick = () => startLineEdit(+cell.closest('.srow').dataset.line, cell);
+  });
+}
+
+function lockTaskControlsForLineEdit(){
+  $('btnGo').disabled=true;
+  $('btnClear').disabled=true;
+  $('btnZip').disabled=true;
+  document.querySelectorAll('.file-actions button,.pri,.line-retranslate').forEach(button => {
+    button.disabled=true;
+  });
+}
+
+function startLineEdit(line, cell){
+  if(jobId || submitting || lineRetranslating || lineSaving || lineEditing) return;
+  const f=files[selectedIdx];
+  if(!f || f.content_out === null || typeof f.content !== 'string') return;
+  const sourceLines=f.content.split('\n');
+  const info=sourceLineInfo(sourceLines)[line];
+  if(!info?.translate) return;
+  const translatedLines=String(f.content_out).split('\n');
+  lineEditing={name:f.name,line};
+  cell.textContent=translatedLineBody(info, translatedLines[line] || '');
+  cell.classList.remove('empty');
+  cell.contentEditable='true';
+  cell.setAttribute('role','textbox');
+  cell.setAttribute('aria-label',`编辑第 ${line+1} 行译文`);
+  const row=cell.closest('.srow');
+  const retryButton=row.querySelector('.line-retranslate');
+  const saveButton=row.querySelector('.line-save');
+  if(retryButton) retryButton.hidden=true;
+  if(saveButton) saveButton.hidden=false;
+  lockTaskControlsForLineEdit();
+  cell.onkeydown=event => {
+    if(event.key==='Enter'){
+      event.preventDefault();
+      saveLineEdit(line);
+    }else if(event.key==='Escape'){
+      event.preventDefault();
+      lineEditing=null;
+      render();
+    }
+  };
+  cell.focus();
+  const range=document.createRange(), selection=window.getSelection();
+  range.selectNodeContents(cell); range.collapse(false);
+  selection.removeAllRanges(); selection.addRange(range);
+}
+
+async function saveLineEdit(line){
+  if(!lineEditing || lineSaving || lineEditing.line!==line) return;
+  const fileIndex=files.findIndex(file => file.name===lineEditing.name);
+  const f=files[fileIndex];
+  const row=document.querySelector(`.srow[data-line="${line}"]`);
+  const cell=row?.querySelector('.dcell');
+  const saveButton=row?.querySelector('.line-save');
+  if(!f || !cell) return;
+  const editedText=String(cell.innerText ?? cell.textContent ?? '').replace(/\r?\n+/g,' ');
+  const savedTop=cell.closest('.split')?.scrollTop || 0;
+  lineSaving=true;
+  cell.contentEditable='false';
+  if(saveButton) saveButton.disabled=true;
+  try{
+    const response=await fetch('/api/update-line', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({
+        config:requestConfig(), name:f.name, content:f.content,
+        translated_content:f.content_out, line, text:editedText
+      })
+    });
+    const result=await response.json().catch(() => ({}));
+    if(!response.ok || !result.ok) throw new Error(result.error || `HTTP ${response.status}`);
+    f.content_out=result.content;
+    f.output_name=result.output_name || f.output_name;
+    f.target_language=result.target_language || f.target_language;
+    f.error=''; f.status='ok';
+    lineEditing=null; lineSaving=false;
+    selectedIdx=fileIndex;
+    render();
+    requestAnimationFrame(() => {
+      const scroller=document.querySelector(`#split-${fileIndex}`);
+      if(scroller) scroller.scrollTop=savedTop;
+    });
+  }catch(error){
+    lineSaving=false;
+    cell.contentEditable='true';
+    if(saveButton) saveButton.disabled=false;
+    cell.focus();
+    await appAlert('保存译文失败：' + error.message,'保存失败');
+  }
+}
+
+async function retranslateLine(line){
+  if(jobId || submitting || lineRetranslating || lineSaving || lineEditing) return;
+  const fileIndex=selectedIdx, f=files[fileIndex];
+  if(!f || typeof f.content !== 'string' || f.content_out === null) return;
+  const currentScroller=document.querySelector(`#split-${fileIndex}`);
+  const savedTop=currentScroller ? currentScroller.scrollTop : 0;
+  lineRetranslating={name:f.name,line};
+  render();
+  requestAnimationFrame(() => {
+    const scroller=document.querySelector(`#split-${fileIndex}`);
+    if(scroller) scroller.scrollTop=savedTop;
+  });
+  try{
+    const response=await fetch('/api/retranslate-line', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({
+        config:requestConfig(), name:f.name, content:f.content,
+        translated_content:f.content_out, line
+      })
+    });
+    const result=await response.json().catch(() => ({}));
+    if(!response.ok || !result.ok) throw new Error(result.error || `HTTP ${response.status}`);
+    f.content_out=result.content;
+    f.output_name=result.output_name || f.output_name;
+    f.target_language=result.target_language || f.target_language;
+    f.error=''; f.status='ok';
+  }catch(error){
+    await appAlert('单行重译失败：' + error.message,'重译失败');
+  }finally{
+    lineRetranslating=null;
+    render();
+    requestAnimationFrame(() => {
+      if(files[selectedIdx]!==f) return;
+      const scroller=document.querySelector(`#split-${selectedIdx}`);
+      if(scroller) scroller.scrollTop=savedTop;
+    });
+  }
 }
 function setupCompareResize(){
   const wrap = document.querySelector('.compare-wrap');
@@ -731,9 +1056,22 @@ function appendOut(i, text, line){
   const el = $('split-'+i);
   if(!el) return;
   const oldTop = el.scrollTop;
-  el.innerHTML = splitHtml(i);
-  if(trackingProgress && files[i].name===currentName) scrollToLatestTranslation(i);
-  else el.scrollTop = oldTop;
+  const row = Number.isInteger(Number(line))
+    ? el.querySelector(`.srow[data-line="${Number(line)}"]`) : null;
+  const cell = row?.querySelector('.dcell');
+  if(cell){
+    cell.textContent = text || '…';
+    cell.classList.toggle('empty', !text);
+  }else{
+    el.innerHTML = splitHtml(i);
+    el.scrollTop = oldTop;
+  }
+  if(trackingProgress && files[i].name===currentName && !streamScrollFrame){
+    streamScrollFrame = requestAnimationFrame(() => {
+      streamScrollFrame = 0;
+      scrollToLatestTranslation(i);
+    });
+  }
 }
 function scrollToLatestTranslation(fi){
   const el=$('split-'+fi); if(!el) return;
@@ -833,7 +1171,11 @@ function connectSSE(jid){
   es.addEventListener('fail', e => {
     try{
       const d = JSON.parse(e.data), fi = fileIdx(d.file);
-      if(fi >= 0){ files[fi].error=d.msg||'翻译失败'; setChip(fi,'err'); render(); }
+      if(fi >= 0){
+        files[fi].error=d.msg||'翻译失败';
+        files[fi].live_out={}; files[fi].legacy_out='';
+        setChip(fi,'err'); render();
+      }
     }catch(_){}
   });
   es.addEventListener('progress', e => {
@@ -882,40 +1224,59 @@ function syncPriority(){
   fetch('/api/prioritize', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({job:jobId, names})}).catch(()=>{});
 }
 
-async function submitJob(subFiles){
-  if(submitting || jobId || !subFiles.length) return;
+async function submitJob(subFiles, {retranslate=false}={}){
+  if(submitting || jobId || lineRetranslating || lineSaving || lineEditing || !subFiles.length) return;
   submitting = true;
-  $('btnGo').disabled = true; $('btnZip').disabled = true;
-  updateTotalProgress(0, subFiles.length);
-  updateFileProgress(0, 0);
-  interrupted = false; currentName = ''; lastJob = null;
-  subFiles.forEach(f => { f.status='q'; f.error=''; f.live_out={};
-    f.legacy_out=''; f.content_out=null; f.output_name=null; f.target_language=null; f.retry_queued=false; });
-  $('btnStop').disabled = false;
-  render();
-  const cfg = readCfg();
+  try{
+    render();
+  }catch(error){
+    submitting = false;
+    console.error('启动前渲染失败', error);
+    await appAlert('启动失败：无法渲染任务内容，请重新添加文件后重试。','启动失败');
+    return;
+  }
   const payload = {
-    config:{ server:cfg.server, api_key:cfg.key, model:cfg.model, context_size:+cfg.ctx,
-      temperature:+cfg.temp, top_k:+cfg.topk, top_p:+cfg.topp, repeat_penalty:+cfg.rp,
-      batch_paras:+cfg.bp, chunk_chars:+cfg.cc, context_chars:+cfg.contextChars,
-      future_context_chars:+cfg.futureContextChars, src_lang:cfg.src, tgt_lang:cfg.tgt,
-      translation_style:cfg.style,
-      system_prompt:cfg.sys },
-    files: subFiles.map(f => ({name:f.name, content:f.content})),
+    config:requestConfig(),
+    files: subFiles.map(f => {
+      const item={name:f.name, content:f.content};
+      if(retranslate){
+        item.retranslate=true;
+        item.translated_content=typeof f.content_out==='string' ? f.content_out : '';
+      }
+      return item;
+    }),
     priority: subFiles.filter(f => f.priority).map(f => f.name)
   };
+  const controller=new AbortController();
+  const submitTimeout=setTimeout(() => controller.abort(), 30000);
   try{
-    const r = await fetch('/api/translate', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
-    const d = await r.json();
-    if(d.error){ submitting=false; alert('启动失败: '+d.error); render(); return; }
+    const r = await fetch('/api/translate', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(payload), signal:controller.signal
+    });
+    const d = await r.json().catch(() => ({}));
+    if(!r.ok || d.error || !d.job) throw new Error(d.error || `HTTP ${r.status}`);
     jobId = d.job; jobNames = subFiles.map(f => f.name);
-    submitting = false;
+    interrupted = false; currentName = ''; lastJob = null;
+    subFiles.forEach(f => { f.status='q'; f.error=''; f.live_out={}; f.legacy_out='';
+      if(!retranslate){ f.content_out=null; f.output_name=null; f.target_language=null; }
+      f.retry_queued=false;
+    });
+    updateTotalProgress(0, subFiles.length);
+    updateFileProgress(0, 0);
+    $('btnStop').disabled = false;
     localStorage.setItem('bench_job', jobId);
     connectSSE(jobId);
     $('progressBox').style.display='block';
     pollTimer = setInterval(() => poll(false), 15000);
+  }catch(e){
+    const message=e.name==='AbortError' ? '启动超时，现有任务和译文未被修改' : e.message;
+    await appAlert('启动失败：' + message,'启动失败');
+  }finally{
+    clearTimeout(submitTimeout);
+    submitting = false;
     render();
-  }catch(e){ submitting=false; alert('请求失败: '+e); render(); }
+  }
 }
 
 $('btnGo').addEventListener('click', () => submitJob(unfinishedFiles()));
@@ -1014,6 +1375,9 @@ function download(i){
 }
 
 $('btnTest').addEventListener('click', ping);
+$('cfg_thinking').addEventListener('click', () => {
+  setThinkingMode($('cfg_thinking').dataset.enabled!=='true');
+});
 $('btnSave').addEventListener('click', () => {
   localStorage.setItem('bench_cfg', JSON.stringify(readCfg()));
   const button=$('btnSave'); button.textContent='已保存'; button.disabled=true;
@@ -1038,17 +1402,31 @@ $('btnZip').addEventListener('click', () => {
 /* ---------- 刷新后恢复: 恢复文件列表 + 接回运行中的任务 ---------- */
 async function reconnectJob(){
   let jid = localStorage.getItem('bench_job');
-  if(!jid){
-    try{ const r = await fetch('/api/running'); const d = await r.json(); if(d.job) jid = d.job; }catch(e){}
+  async function findRunningJob(){
+    try{ const r = await fetch('/api/running'); const d = await r.json(); return d.job || null; }catch(e){ return null; }
   }
+  if(!jid) jid = await findRunningJob();
   if(!jid) return;
   try{
-    const r = await fetch('/api/status?job=' + jid + '&full=1');
-    const d = await r.json();
-    if(!d.status || d.status === 'notfound'){ localStorage.removeItem('bench_job'); return; }
-    if(d.names && files.length === 0){
-      files = d.names.map(n => ({name:n, content:null, status:'q', error:'',
-        content_out:null, live_out:{}, legacy_out:'', output_name:null, target_language:null, priority:false, retry_queued:false}));
+    let r = await fetch('/api/status?job=' + jid + '&full=1');
+    let d = await r.json();
+    if(!d.status || d.status === 'notfound'){
+      localStorage.removeItem('bench_job');
+      jid = await findRunningJob();
+      if(!jid) return;
+      r = await fetch('/api/status?job=' + jid + '&full=1');
+      d = await r.json();
+      if(!d.status || d.status === 'notfound') return;
+    }
+    const sources = Array.isArray(d.sources) ? d.sources : (d.names||[]).map(name => ({name, content:null}));
+    for(const source of sources){
+      let file = files.find(f => f.name === source.name);
+      if(!file){
+        file = {name:source.name, content:null, status:'q', error:'', content_out:null,
+          live_out:{}, legacy_out:'', output_name:null, target_language:null, priority:false, retry_queued:false};
+        files.push(file);
+      }
+      if(typeof source.content === 'string') file.content = source.content;
     }
     currentName = d.current || '';
     $('cur').textContent = d.current ? '正在翻译：' + d.current + ' …' : '';

@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """本地翻译工作台 · 后端
 
-调用本地 OpenAI 兼容翻译模型(如 llama-server / HY-MT1.5), 提供网页拖拽翻译。
+调用本地 OpenAI 兼容翻译模型（如 llama-server / Hy-MT2），提供网页拖拽翻译。
 
 用法:
   python app.py [port]        # 默认 9000
@@ -37,13 +37,14 @@ MAX_FINISHED_JOBS = 50
 
 DEFAULT_CONFIG = {
     "server": "http://127.0.0.1:8081",
-    "api_key": "",
-    "model": "hy-mt1.5-1.8b",
+    "api_key": "local-qwen",
+    "model": "hy-mt2-7b",
     "context_size": 65536,        # 服务端槽位上下文(用于预算 max_tokens)
     "temperature": 0.7,
     "top_k": 20,
     "top_p": 0.6,
     "repeat_penalty": 1.05,
+    "enable_thinking": False,     # 翻译默认关闭思考模式，避免额外推理和输出污染
     "batch_paras": 15,            # 每批最多段落数
     "chunk_chars": 12000,         # 每批最多字符数
     "context_chars": 4000,        # 携带此前原文+译文作为术语/语气参考，0=关闭
@@ -201,7 +202,46 @@ class Translator:
                 self._conn = None
                 self._requests_on_connection = 0
 
-    def _post_json(self, payload):
+    @staticmethod
+    def _read_stream_response(resp, on_delta=None):
+        """读取 OpenAI 兼容 SSE，返回与非流式响应相同的最小结构。"""
+        chunks = []
+        finish_reason = None
+        while True:
+            raw_line = resp.readline()
+            if not raw_line:
+                break
+            line = raw_line.decode("utf-8", "replace").strip()
+            if not line or line.startswith(":") or not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                # 继续由 HTTPResponse 读取完 chunked 终止块，保证连接可复用。
+                resp.read()
+                break
+            event = json.loads(data)
+            choices = event.get("choices") or []
+            if not choices:
+                continue
+            choice = choices[0]
+            delta = choice.get("delta") or {}
+            piece = delta.get("content")
+            if piece is None:
+                piece = choice.get("text", "")
+            if piece:
+                chunks.append(str(piece))
+                if on_delta:
+                    on_delta(str(piece), "".join(chunks))
+            if choice.get("finish_reason") is not None:
+                finish_reason = choice.get("finish_reason")
+        return {
+            "choices": [{
+                "message": {"content": "".join(chunks)},
+                "finish_reason": finish_reason,
+            }]
+        }
+
+    def _post_json(self, payload, on_delta=None):
         _, _, _, prefix = self._server_parts()
         path = prefix + "/v1/chat/completions"
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -217,8 +257,8 @@ class Translator:
             conn = self._connection()
             conn.request("POST", path, body=body, headers=headers)
             resp = conn.getresponse()
-            data = resp.read()
             if not 200 <= resp.status < 300:
+                data = resp.read()
                 detail = data.decode("utf-8", "replace")[:500]
                 raw_retry_after = resp.getheader("Retry-After")
                 try:
@@ -226,7 +266,16 @@ class Translator:
                 except (TypeError, ValueError):
                     retry_after = None
                 raise ModelServiceError(resp.status, detail, retry_after)
-            result = json.loads(data.decode("utf-8"))
+            content_type = str(resp.getheader("Content-Type", "")).lower()
+            if payload.get("stream") and "text/event-stream" in content_type:
+                result = self._read_stream_response(resp, on_delta)
+            else:
+                data = resp.read()
+                result = json.loads(data.decode("utf-8"))
+                if on_delta:
+                    content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+                    if content:
+                        on_delta(content, content)
             self._requests_on_connection += 1
             max_requests = max(1, int(self.cfg.get("connection_max_requests", 32)))
             if resp.will_close or self._requests_on_connection >= max_requests:
@@ -236,8 +285,8 @@ class Translator:
             self.close()
             raise
 
-    def translate_text(self, text, context_before="", context_after=""):
-        """翻译一段文本, 返回 (成功, 结果/错误)。"""
+    def _system_prompt(self):
+        """组合固定规则、用户补充要求和风格偏好。"""
         cfg = self.cfg
         extra_prompt = str(cfg.get("system_prompt", "") or "").strip()
         style = cfg.get("translation_style", "自动判断")
@@ -247,22 +296,53 @@ class Translator:
             prompt_parts.append(f"【用户补充要求】\n{extra_prompt}")
         if style_prompt:
             prompt_parts.append(f"【风格偏好（{style}）】\n{style_prompt}")
-        sys_prompt = "\n\n".join(prompt_parts)
-        est_out = len(text) // 2 + 40
-        est_in = (
-            len(text) + len(context_before) + len(context_after) + len(sys_prompt)
-        ) // 2 + 160
+        return "\n\n".join(prompt_parts)
+
+    @staticmethod
+    def _estimate_tokens(text):
+        """在没有模型 tokenizer 时保守估算 token；非 ASCII 文字按更高密度计算。"""
+        text = str(text or "")
+        non_ascii = sum(1 for char in text if ord(char) > 127)
+        ascii_chars = len(text) - non_ascii
+        return max(1, int(non_ascii * 1.2 + ascii_chars / 3.2) + 1)
+
+    def _output_token_budget(self, text):
+        """为完整译文留出足够空间，也限制模型跑偏时的无限生成。"""
+        return min(80000, max(256, int(self._estimate_tokens(text) * 1.5) + 256))
+
+    def _fits_whole_document(self, text, previous_translation=""):
+        """判断全文（以及重译时的旧译文）能否连同完整输出安全放入上下文。"""
+        estimated_input = (
+            self._estimate_tokens(self._system_prompt())
+            + self._estimate_tokens(text)
+            + (self._estimate_tokens(previous_translation) if previous_translation else 0)
+            + 512  # 用户提示、语言标签和聊天模板余量
+        )
+        estimated_total = estimated_input + self._output_token_budget(text) + 256
+        context_size = max(2048, int(self.cfg.get("context_size", 65536)))
+        return estimated_total <= int(context_size * 0.90)
+
+    def translate_text(
+        self, text, context_before="", context_after="",
+        previous_translation="", retranslate=False, on_stream=None,
+    ):
+        """翻译一段文本, 返回 (成功, 结果/错误)。"""
+        cfg = self.cfg
+        sys_prompt = self._system_prompt()
+        est_in = sum(self._estimate_tokens(part) for part in (
+            text, context_before, context_after, previous_translation, sys_prompt
+        )) + 256
         ctx = max(2048, int(cfg.get("context_size", 65536)))
         # 输出约为输入量级; 限制 max_tokens 防止模型跑偏时无限生成导致卡死
         available = ctx - est_in - 96
         if available < 256:
             return False, f"输入超出上下文预算（估算输入 {est_in} tokens，上下文 {ctx}）"
-        max_tokens = min(int(est_out * 1.6) + 200, available, 80000)
+        max_tokens = min(self._output_token_budget(text), available)
         src = cfg.get("src_lang", "自动判断")
         tgt = cfg.get("tgt_lang", "中文")
         if src == "自动判断":
             src = detect_lang(text)
-        if context_before or context_after:
+        if context_before or context_after or retranslate:
             references = []
             if context_before:
                 references.append(
@@ -272,12 +352,29 @@ class Translator:
                 references.append(
                     "【下文参考（尚未翻译的原文）】\n" + context_after
                 )
-            prompt = (
-                "以下参考内容只用于理解语境、消除歧义并统一术语、称谓和语气。\n"
-                "只翻译【当前待译文本】，不得翻译、续写或输出任何前文和下文参考。\n\n"
-                + "\n\n".join(references)
-                + f"\n\n【当前待译文本（{src} → {tgt}）】\n{text}"
-            )
+            reference_text = "\n\n".join(references)
+            if retranslate:
+                previous_block = (
+                    f"\n\n【当前旧译文（仅供检查，不得盲目照抄）】\n{previous_translation}"
+                    if previous_translation else ""
+                )
+                prompt = (
+                    "这是重译校订任务。参考内容只用于理解语境、消除歧义并统一术语、称谓和语气。\n"
+                    "请对照原文检查旧译文中的错译、漏译、增译、称谓、术语、语气和不自然表达，"
+                    "然后完整地重新翻译当前文本。旧译文可能有错，只能作为纠错参考。\n"
+                    "只输出修正后的完整译文，不得输出分析、修改说明、原文、旧译文或前后文；"
+                    "输出行数和顺序必须与当前待译文本一致。\n\n"
+                    + (reference_text + "\n\n" if reference_text else "")
+                    + previous_block
+                    + f"\n\n【当前待译文本（{src} → {tgt}）】\n{text}"
+                )
+            else:
+                prompt = (
+                    "以下参考内容只用于理解语境、消除歧义并统一术语、称谓和语气。\n"
+                    "只翻译【当前待译文本】，不得翻译、续写或输出任何前文和下文参考。\n\n"
+                    + reference_text
+                    + f"\n\n【当前待译文本（{src} → {tgt}）】\n{text}"
+                )
         else:
             prompt = f"将以下{src}文本翻译为{tgt}，注意只需要输出翻译后的结果，不要额外解释：\n\n{text}"
         payload = {
@@ -289,13 +386,23 @@ class Translator:
             "top_k": cfg.get("top_k", 20),
             "top_p": cfg.get("top_p", 0.6),
             "repeat_penalty": cfg.get("repeat_penalty", 1.05),
+            "chat_template_kwargs": {
+                "enable_thinking": bool(cfg.get("enable_thinking", False)),
+            },
+            "stream": bool(on_stream),
         }
         last = None
         retryable = True
         attempts = max(1, int(cfg.get("max_retries", 5)))
         for attempt in range(attempts):
             try:
-                r = self._post_json(payload)
+                if on_stream:
+                    on_stream("")
+                r = self._post_json(
+                    payload,
+                    (lambda _piece, accumulated: on_stream(accumulated))
+                    if on_stream else None,
+                )
                 out = r["choices"][0]["message"]["content"]
                 if r["choices"][0].get("finish_reason") == "length":
                     raise RuntimeError("译文达到 max_tokens，输出被截断")
@@ -359,27 +466,74 @@ class Translator:
                 break
         return "\n\n".join(blocks)
 
-    def translate_batch(self, paras, history=None, future=None):
+    def translate_batch(
+        self, paras, history=None, future=None, previous_translations=None,
+        preview=None,
+    ):
         """批翻译行；数量不匹配时逐行回退，保证一对一。"""
         history = list(history or [])
         future = list(future or [])
+        is_retranslation = previous_translations is not None
+        previous_translations = list(previous_translations or [])
         text = "\n\n".join(paras)
+        previous_text = "\n\n".join(previous_translations)
+        preview_values = {}
+
+        def set_preview(pos, value):
+            if not preview or pos < 0 or pos >= len(paras):
+                return
+            value = str(value or "")
+            if preview_values.get(pos) == value:
+                return
+            preview_values[pos] = value
+            preview(pos, value)
+
+        def clear_previews():
+            for pos in list(preview_values):
+                set_preview(pos, "")
+
+        def stream_batch(accumulated):
+            if not accumulated:
+                clear_previews()
+                return
+            partial_lines = [
+                self._one_line(line)
+                for line in str(accumulated).splitlines()
+                if line.strip()
+            ]
+            for pos, line in enumerate(partial_lines[:len(paras)]):
+                set_preview(pos, line)
+
         ok, out = self.translate_text(
             text,
             self._context_text(history),
             self._future_context_text(future),
+            previous_text,
+            is_retranslation,
+            stream_batch if preview else None,
         )
         if ok:
             lines = [self._one_line(line) for line in out.splitlines() if line.strip()]
             if len(lines) == len(paras):
                 return True, lines
+        clear_previews()
         res = []
         for pos, p in enumerate(paras):
             line_future = paras[pos + 1:] + future
+
+            def stream_line(accumulated, current_pos=pos):
+                set_preview(
+                    current_pos,
+                    self._one_line(accumulated) if accumulated else "",
+                )
+
             ok2, o2 = self.translate_text(
                 p,
                 self._context_text(history),
                 self._future_context_text(line_future),
+                previous_translations[pos] if pos < len(previous_translations) else "",
+                is_retranslation,
+                stream_line if preview else None,
             )
             if not ok2:
                 return False, o2
@@ -442,7 +596,71 @@ class Translator:
             return {"translate": False, "original": line}, in_fence
         return {"translate": True, "prefix": prefix, "text": text, "suffix": suffix}, in_fence
 
-    def translate_content(self, content, filename="", emit=None, progress=None):
+    @staticmethod
+    def _translated_unit_text(unit, translated_line):
+        """去掉已保留的 Markdown 前后缀，提取可作为上文参考的译文正文。"""
+        text = str(translated_line)
+        prefix = unit.get("prefix", "")
+        suffix = unit.get("suffix", "")
+        if prefix and text.startswith(prefix):
+            text = text[len(prefix):]
+        if suffix and text.endswith(suffix):
+            text = text[:-len(suffix)]
+        return text.strip()
+
+    def retranslate_line(self, content, translated_content, line_index):
+        """使用文件上下文重译一个物理行，返回 (新行, 更新后的完整译文)。"""
+        source_lines = str(content).split("\n")
+        try:
+            line_index = int(line_index)
+        except (TypeError, ValueError):
+            raise ValueError("行号无效")
+        if line_index < 0 or line_index >= len(source_lines):
+            raise ValueError("行号超出文件范围")
+
+        units = []
+        in_fence = False
+        for line in source_lines:
+            unit, in_fence = self._markdown_unit(line, in_fence)
+            units.append(unit)
+        target = units[line_index]
+        if not target.get("translate"):
+            raise ValueError("该行是空行、代码或 Markdown 结构，不能单独重译")
+
+        translated_lines = str(translated_content).split("\n")
+        if len(translated_lines) < len(source_lines):
+            translated_lines.extend(source_lines[len(translated_lines):])
+
+        history = []
+        for idx, unit in enumerate(units[:line_index]):
+            if not unit.get("translate") or idx >= len(translated_lines):
+                continue
+            translated = self._translated_unit_text(unit, translated_lines[idx])
+            if translated:
+                history.append((unit["text"], translated))
+
+        future = [
+            unit["text"] for unit in units[line_index + 1:]
+            if unit.get("translate")
+        ]
+        previous_translation = (
+            self._translated_unit_text(target, translated_lines[line_index])
+            if line_index < len(translated_lines) else ""
+        )
+        ok, translated = self.translate_batch(
+            [target["text"]], history, future, [previous_translation]
+        )
+        if not ok:
+            return False, translated
+
+        output_line = target["prefix"] + translated[0] + target["suffix"]
+        translated_lines[line_index] = output_line
+        return True, (output_line, "\n".join(translated_lines))
+
+    def translate_content(
+        self, content, filename="", emit=None, progress=None,
+        previous_content=None,
+    ):
         """翻译一段文件内容, 返回 (成功, 翻译后内容/错误)。
         保留空行、标题层级、列表/引用前缀与代码块。emit(行号, 译文) 推送定位结果。"""
         lines = content.split("\n")
@@ -460,7 +678,26 @@ class Translator:
         if progress:
             progress(0, len(translatable))
         history = []
-        batches = self._batches(translatable)
+        previous_lines = (
+            str(previous_content).split("\n") if previous_content is not None else []
+        )
+        whole_sources = "\n\n".join(text for _, text in translatable)
+        whole_previous = ""
+        if previous_content is not None:
+            previous_bodies = []
+            for line_index, _ in translatable:
+                previous_line = (
+                    previous_lines[line_index]
+                    if line_index < len(previous_lines) else ""
+                )
+                previous_bodies.append(
+                    self._translated_unit_text(units[line_index], previous_line)
+                )
+            whole_previous = "\n\n".join(previous_bodies)
+        if translatable and self._fits_whole_document(whole_sources, whole_previous):
+            batches = [translatable]
+        else:
+            batches = self._batches(translatable)
         for batch_pos, batch in enumerate(batches):
             sources = [text for _, text in batch]
             future_sources = [
@@ -468,7 +705,34 @@ class Translator:
                 for future_batch in batches[batch_pos + 1:]
                 for _, text in future_batch
             ]
-            ok, trans = self.translate_batch(sources, history, future_sources)
+            previous_batch = None
+            if previous_content is not None:
+                previous_batch = []
+                for line_index, _ in batch:
+                    previous_line = (
+                        previous_lines[line_index]
+                        if line_index < len(previous_lines) else ""
+                    )
+                    previous_batch.append(
+                        self._translated_unit_text(units[line_index], previous_line)
+                    )
+            ok, trans = self.translate_batch(
+                sources,
+                history,
+                future_sources,
+                previous_batch,
+                (
+                    lambda pos, text, current_batch=batch: emit(
+                        current_batch[pos][0],
+                        (
+                            units[current_batch[pos][0]]["prefix"]
+                            + text
+                            + units[current_batch[pos][0]]["suffix"]
+                        ) if text else "",
+                    )
+                    if emit else None
+                ),
+            )
             if not ok:
                 return False, trans
             for (idx, source), translated in zip(batch, trans):
@@ -530,8 +794,13 @@ def run_job(job_id):
                 emit("file_progress", file=name, idx=idx, done=file_done, total=file_total)
 
             try:
+                previous_content = (
+                    files[idx].get("translated_content")
+                    if files[idx].get("retranslate") else None
+                )
                 ok, out = translator.translate_content(
-                    content, name, emit=emit_line, progress=emit_file_progress
+                    content, name, emit=emit_line, progress=emit_file_progress,
+                    previous_content=previous_content,
                 )
                 if not ok:
                     job["results"].append({"name": name, "status": "error", "error": out})
@@ -654,7 +923,8 @@ class Handler(BaseHTTPRequestHandler):
                 base = {k: j.get(k) for k in
                         ("status", "total", "done", "current", "error",
                          "current_file_done", "current_file_total")}
-                full = query.get("full", [""])[0] == "1" or j.get("status") != "running"
+                requested_full = query.get("full", [""])[0] == "1"
+                full = requested_full or j.get("status") != "running"
                 if full:
                     base["results"] = list(j.get("results", []))
                 else:
@@ -664,6 +934,13 @@ class Handler(BaseHTTPRequestHandler):
                         for result in j.get("results", [])
                     ]
                 base["names"] = [f["name"] for f in j.get("files", [])]
+                # 仅在显式完整恢复时返回原文，供刷新、跨浏览器或接口提交的任务
+                # 重建对照视图。普通状态轮询不携带正文，避免重复传输大文本。
+                if requested_full:
+                    base["sources"] = [
+                        {"name": f["name"], "content": f.get("content", "")}
+                        for f in j.get("files", [])
+                    ]
                 base["done_names"] = j.get("done_names", [])
                 base["partials"] = {
                     name: dict(lines) for name, lines in j.get("partials", {}).items()
@@ -830,6 +1107,140 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.split("?")[0]
+        if path == "/api/update-line":
+            try:
+                body = self._read_body()
+            except Exception:
+                self._send_json({"error": "bad json"}, 400)
+                return
+            cfg = body.get("config", {})
+            name = body.get("name", "")
+            content = body.get("content")
+            translated_content = body.get("translated_content")
+            edited_text = body.get("text")
+            try:
+                line_index = int(body.get("line"))
+            except (TypeError, ValueError):
+                self._send_json({"error": "行号无效"}, 400)
+                return
+            if (not isinstance(cfg, dict) or not isinstance(name, str) or not name
+                    or not isinstance(content, str) or not isinstance(translated_content, str)
+                    or not isinstance(edited_text, str)):
+                self._send_json({"error": "invalid line update request"}, 400)
+                return
+
+            source_lines = content.split("\n")
+            if line_index < 0 or line_index >= len(source_lines):
+                self._send_json({"error": "行号超出文件范围"}, 400)
+                return
+            units = []
+            in_fence = False
+            for source_line in source_lines:
+                unit, in_fence = Translator._markdown_unit(source_line, in_fence)
+                units.append(unit)
+            unit = units[line_index]
+            if not unit.get("translate"):
+                self._send_json({"error": "该行不能编辑译文"}, 400)
+                return
+
+            translated_lines = translated_content.split("\n")
+            if len(translated_lines) < len(source_lines):
+                translated_lines.extend(source_lines[len(translated_lines):])
+            edited_body = Translator._one_line(edited_text)
+            output_line = unit["prefix"] + edited_body + unit["suffix"]
+            translated_lines[line_index] = output_line
+            updated_content = "\n".join(translated_lines)
+            target = cfg.get("tgt_lang", "中文")
+            out_name = output_filename(name, target)
+            os.makedirs(OUTPUTS_DIR, exist_ok=True)
+            try:
+                with open(os.path.join(OUTPUTS_DIR, out_name), "w", encoding="utf-8") as fh:
+                    fh.write(updated_content)
+                metadata = {
+                    "source_name": os.path.basename(name.replace("\\", "/")),
+                    "source_sha256": source_digest(content),
+                    "target_language": target,
+                    "output_name": out_name,
+                }
+                with open(os.path.join(OUTPUTS_DIR, out_name + ".meta.json"), "w", encoding="utf-8") as fh:
+                    json.dump(metadata, fh, ensure_ascii=False, indent=2)
+            except OSError as exc:
+                self._send_json({"error": f"保存编辑失败: {exc}"}, 500)
+                return
+
+            with JOBS_LOCK:
+                for job in JOBS.values():
+                    for old_result in job.get("results", []):
+                        if old_result.get("output_name") == out_name:
+                            old_result["content"] = updated_content
+                            old_result["target_language"] = target
+            self._send_json({
+                "ok": True, "line": line_index, "text": output_line,
+                "content": updated_content, "output_name": out_name,
+                "target_language": target,
+            })
+            return
+        if path == "/api/retranslate-line":
+            try:
+                body = self._read_body()
+            except Exception:
+                self._send_json({"error": "bad json"}, 400)
+                return
+            cfg = body.get("config", {})
+            name = body.get("name", "")
+            content = body.get("content")
+            translated_content = body.get("translated_content")
+            line_index = body.get("line")
+            if (not isinstance(cfg, dict) or not isinstance(name, str) or not name
+                    or not isinstance(content, str) or not isinstance(translated_content, str)):
+                self._send_json({"error": "invalid retranslation request"}, 400)
+                return
+
+            translator = Translator(cfg)
+            try:
+                ok, result = translator.retranslate_line(
+                    content, translated_content, line_index
+                )
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, 400)
+                return
+            finally:
+                translator.close()
+            if not ok:
+                self._send_json({"error": result}, 502)
+                return
+
+            output_line, updated_content = result
+            target = cfg.get("tgt_lang", "中文")
+            out_name = output_filename(name, target)
+            os.makedirs(OUTPUTS_DIR, exist_ok=True)
+            try:
+                with open(os.path.join(OUTPUTS_DIR, out_name), "w", encoding="utf-8") as fh:
+                    fh.write(updated_content)
+                metadata = {
+                    "source_name": os.path.basename(name.replace("\\", "/")),
+                    "source_sha256": source_digest(content),
+                    "target_language": target,
+                    "output_name": out_name,
+                }
+                with open(os.path.join(OUTPUTS_DIR, out_name + ".meta.json"), "w", encoding="utf-8") as fh:
+                    json.dump(metadata, fh, ensure_ascii=False, indent=2)
+            except OSError as exc:
+                self._send_json({"error": f"保存重译结果失败: {exc}"}, 500)
+                return
+
+            with JOBS_LOCK:
+                for job in JOBS.values():
+                    for old_result in job.get("results", []):
+                        if old_result.get("output_name") == out_name:
+                            old_result["content"] = updated_content
+                            old_result["target_language"] = target
+            self._send_json({
+                "ok": True, "line": int(line_index), "text": output_line,
+                "content": updated_content, "output_name": out_name,
+                "target_language": target,
+            })
+            return
         if path == "/api/interrupt":
             try:
                 body = self._read_body()
@@ -873,6 +1284,13 @@ class Handler(BaseHTTPRequestHandler):
         if not all(isinstance(f, dict) and isinstance(f.get("name"), str)
                    and isinstance(f.get("content", ""), str) for f in files):
             self._send_json({"error": "invalid files"}, 400)
+            return
+        if not all(
+            not f.get("retranslate")
+            or isinstance(f.get("translated_content"), str)
+            for f in files
+        ):
+            self._send_json({"error": "invalid retranslation files"}, 400)
             return
         prune_jobs()
         job_id = uuid.uuid4().hex[:12]
