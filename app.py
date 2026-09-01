@@ -15,6 +15,7 @@ import json
 import os
 import queue
 import re
+import socket
 import sys
 import time
 import uuid
@@ -176,6 +177,7 @@ class Translator:
         self._conn = None
         self._server = None
         self._requests_on_connection = 0
+        self._interrupt_event = threading.Event()
 
     def _server_parts(self):
         if self._server is None:
@@ -188,6 +190,8 @@ class Translator:
         return self._server
 
     def _connection(self):
+        if self._interrupt_event.is_set():
+            raise InterruptedError("任务已中断")
         if self._conn is None:
             scheme, host, port, _ = self._server_parts()
             cls = http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
@@ -201,6 +205,22 @@ class Translator:
             finally:
                 self._conn = None
                 self._requests_on_connection = 0
+
+    @property
+    def interrupted(self):
+        return self._interrupt_event.is_set()
+
+    def interrupt(self):
+        """立即终止当前模型请求，并阻止该翻译器继续重试。"""
+        self._interrupt_event.set()
+        conn = self._conn
+        sock = getattr(conn, "sock", None) if conn is not None else None
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        self.close()
 
     @staticmethod
     def _read_stream_response(resp, on_delta=None):
@@ -242,6 +262,8 @@ class Translator:
         }
 
     def _post_json(self, payload, on_delta=None):
+        if self._interrupt_event.is_set():
+            raise InterruptedError("任务已中断")
         _, _, _, prefix = self._server_parts()
         path = prefix + "/v1/chat/completions"
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -325,6 +347,7 @@ class Translator:
     def translate_text(
         self, text, context_before="", context_after="",
         previous_translation="", retranslate=False, on_stream=None,
+        preserve_line_markers=False,
     ):
         """翻译一段文本, 返回 (成功, 结果/错误)。"""
         cfg = self.cfg
@@ -342,6 +365,12 @@ class Translator:
         tgt = cfg.get("tgt_lang", "中文")
         if src == "自动判断":
             src = detect_lang(text)
+        marker_rule = (
+            "【行定位硬性规则】待译文本的每一行都以形如 [[L000001]] 的 ASCII 定位标记开头。"
+            "这些标记是不可修改的占位符，必须在对应译文开头原样输出，数量与顺序不得改变；"
+            "标记本身不得翻译，也不得输出任何额外标记。\n"
+            if preserve_line_markers else ""
+        )
         if context_before or context_after or retranslate:
             references = []
             if context_before:
@@ -364,6 +393,7 @@ class Translator:
                     "然后完整地重新翻译当前文本。旧译文可能有错，只能作为纠错参考。\n"
                     "只输出修正后的完整译文，不得输出分析、修改说明、原文、旧译文或前后文；"
                     "输出行数和顺序必须与当前待译文本一致。\n\n"
+                    + marker_rule
                     + (reference_text + "\n\n" if reference_text else "")
                     + previous_block
                     + f"\n\n【当前待译文本（{src} → {tgt}）】\n{text}"
@@ -372,11 +402,15 @@ class Translator:
                 prompt = (
                     "以下参考内容只用于理解语境、消除歧义并统一术语、称谓和语气。\n"
                     "只翻译【当前待译文本】，不得翻译、续写或输出任何前文和下文参考。\n\n"
+                    + marker_rule
                     + reference_text
                     + f"\n\n【当前待译文本（{src} → {tgt}）】\n{text}"
                 )
         else:
-            prompt = f"将以下{src}文本翻译为{tgt}，注意只需要输出翻译后的结果，不要额外解释：\n\n{text}"
+            prompt = (
+                marker_rule
+                + f"将以下{src}文本翻译为{tgt}，注意只需要输出翻译后的结果，不要额外解释：\n\n{text}"
+            )
         payload = {
             "model": cfg["model"],
             "messages": ([{"role": "system", "content": sys_prompt}] if sys_prompt else [])
@@ -394,14 +428,19 @@ class Translator:
         last = None
         retryable = True
         attempts = max(1, int(cfg.get("max_retries", 5)))
+
+        def handle_stream_delta(_piece, accumulated):
+            if self._interrupt_event.is_set():
+                raise InterruptedError("任务已中断")
+            on_stream(accumulated)
+
         for attempt in range(attempts):
             try:
                 if on_stream:
                     on_stream("")
                 r = self._post_json(
                     payload,
-                    (lambda _piece, accumulated: on_stream(accumulated))
-                    if on_stream else None,
+                    handle_stream_delta if on_stream else None,
                 )
                 out = r["choices"][0]["message"]["content"]
                 if r["choices"][0].get("finish_reason") == "length":
@@ -409,13 +448,16 @@ class Translator:
                 return True, out
             except Exception as e:
                 last = e
+                if self._interrupt_event.is_set():
+                    return False, "任务已中断"
                 retryable = not isinstance(e, ModelServiceError) or e.transient
                 if not retryable or attempt + 1 >= attempts:
                     break
                 retry_after = getattr(e, "retry_after", None)
                 delay = retry_after if retry_after is not None else min(20.0, 1.5 * (2 ** attempt))
                 self.close()
-                time.sleep(delay)
+                if self._interrupt_event.wait(delay):
+                    return False, "任务已中断"
         suffix = f"（已尝试 {attempts} 次）" if attempts > 1 and retryable else ""
         return False, str(last) + suffix
 
@@ -470,14 +512,37 @@ class Translator:
         self, paras, history=None, future=None, previous_translations=None,
         preview=None,
     ):
-        """批翻译行；数量不匹配时逐行回退，保证一对一。"""
+        """批翻译行；用定位标记稳定映射流式输出，异常时仅降级当前区段。"""
         history = list(history or [])
         future = list(future or [])
         is_retranslation = previous_translations is not None
         previous_translations = list(previous_translations or [])
-        text = "\n\n".join(paras)
-        previous_text = "\n\n".join(previous_translations)
+        if not paras:
+            return True, []
+
+        use_markers = len(paras) > 1
+        markers = [f"[[L{pos + 1:06d}]]" for pos in range(len(paras))]
+        text = (
+            "\n".join(marker + para for marker, para in zip(markers, paras))
+            if use_markers else paras[0]
+        )
+        previous_text = (
+            "\n".join(
+                marker + translated
+                for marker, translated in zip(markers, previous_translations)
+            )
+            if use_markers else (previous_translations[0] if previous_translations else "")
+        )
         preview_values = {}
+        # 小模型偶尔会把成对括号写反或漏掉一侧。真正用于定位的是 L 后的
+        # 六位序号，因此解析时宽容括号变形，避免余下全文被并入上一行。
+        marker_pattern = re.compile(
+            r"(?:(?:\[\[|\]\])|[⟦⟧])?\s*L(\d{6})\s*"
+            r"(?:(?:\[\[|\]\])|[⟦⟧])?"
+        )
+        partial_marker_pattern = re.compile(
+            r"\s*(?:(?:\[\[|\]\])|[⟦⟧])\s*L?\d{0,6}\s*$"
+        )
 
         def set_preview(pos, value):
             if not preview or pos < 0 or pos >= len(paras):
@@ -488,21 +553,32 @@ class Translator:
             preview_values[pos] = value
             preview(pos, value)
 
-        def clear_previews():
-            for pos in list(preview_values):
-                set_preview(pos, "")
+        def parse_marked(value):
+            value = str(value or "")
+            matches = list(marker_pattern.finditer(value))
+            positions, lines = [], []
+            for match_pos, match in enumerate(matches):
+                end = matches[match_pos + 1].start() if match_pos + 1 < len(matches) else len(value)
+                positions.append(int(match.group(1)) - 1)
+                lines.append(self._one_line(value[match.end():end]))
+            return positions, lines
 
         def stream_batch(accumulated):
             if not accumulated:
-                clear_previews()
                 return
-            partial_lines = [
-                self._one_line(line)
-                for line in str(accumulated).splitlines()
-                if line.strip()
-            ]
-            for pos, line in enumerate(partial_lines[:len(paras)]):
-                set_preview(pos, line)
+            if use_markers:
+                positions, lines = parse_marked(accumulated)
+                if lines:
+                    # SSE 可能刚好停在下一个标记的一半；不要把这段临时字符
+                    # 显示到上一行，等后续 token 到齐后再正常定位。
+                    lines[-1] = partial_marker_pattern.sub("", lines[-1])
+                for pos, line in zip(positions, lines):
+                    if 0 <= pos < len(paras) and line:
+                        set_preview(pos, line)
+            else:
+                line = self._one_line(accumulated)
+                if line:
+                    set_preview(0, line)
 
         ok, out = self.translate_text(
             text,
@@ -511,21 +587,60 @@ class Translator:
             previous_text,
             is_retranslation,
             stream_batch if preview else None,
+            preserve_line_markers=use_markers,
         )
-        if ok:
-            lines = [self._one_line(line) for line in out.splitlines() if line.strip()]
-            if len(lines) == len(paras):
+        if not ok:
+            return False, out
+
+        if use_markers:
+            positions, lines = parse_marked(out)
+            if (
+                positions == list(range(len(paras)))
+                and len(lines) == len(paras)
+                and all(lines)
+            ):
                 return True, lines
-        clear_previews()
+        else:
+            translated = self._one_line(out)
+            if translated:
+                return True, [translated]
+
+        # 全文模式格式异常时，先缩小到正常批量大小。保留已经显示的临时译文，
+        # 子批次产生新 token 后只覆盖对应位置，不再清空整篇并从头闪回。
+        batch_size = max(1, int(self.cfg.get("batch_paras", 15)))
+        if len(paras) > batch_size:
+            res = []
+            sub_history = list(history)
+            for start in range(0, len(paras), batch_size):
+                end = min(len(paras), start + batch_size)
+                sub_previous = (
+                    previous_translations[start:end] if is_retranslation else None
+                )
+
+                def stream_sub(pos, value, offset=start):
+                    set_preview(offset + pos, value)
+
+                ok2, out2 = self.translate_batch(
+                    paras[start:end],
+                    sub_history,
+                    paras[end:] + future,
+                    sub_previous,
+                    stream_sub if preview else None,
+                )
+                if not ok2:
+                    return False, out2
+                res.extend(out2)
+                sub_history.extend(zip(paras[start:end], out2))
+            return True, res
+
+        # 小批次仍未遵守定位格式时才逐行重译。空的流事件不会抹掉已有预览。
         res = []
         for pos, p in enumerate(paras):
             line_future = paras[pos + 1:] + future
 
             def stream_line(accumulated, current_pos=pos):
-                set_preview(
-                    current_pos,
-                    self._one_line(accumulated) if accumulated else "",
-                )
+                if accumulated:
+                    set_preview(current_pos, self._one_line(accumulated))
 
             ok2, o2 = self.translate_text(
                 p,
@@ -748,11 +863,12 @@ class Translator:
 
 
 def run_job(job_id):
-    """后台翻译任务, 支持中断(interrupt)与优先级插队(priority 文件名列表)。
-    当前正在翻译的文件不被打断; 下个文件优先从 priority 里选。"""
+    """后台翻译任务，支持立即中断与优先级插队。"""
     job = JOBS[job_id]
     cfg = job["config"]
     translator = Translator(cfg)
+    with JOBS_LOCK:
+        job["translator"] = translator
     files = job["files"]
     job["total"] = len(files)
     job["done_names"] = []
@@ -802,6 +918,11 @@ def run_job(job_id):
                     content, name, emit=emit_line, progress=emit_file_progress,
                     previous_content=previous_content,
                 )
+                if job.get("interrupt") or translator.interrupted:
+                    with JOBS_LOCK:
+                        job["partials"].pop(name, None)
+                    emit("file_reset", file=name, idx=idx)
+                    break
                 if not ok:
                     job["results"].append({"name": name, "status": "error", "error": out})
                     emit("fail", file=name, msg=out)
@@ -830,6 +951,11 @@ def run_job(job_id):
                         total=job.get("current_file_total", 0),
                     )
             except Exception as e:
+                if job.get("interrupt") or translator.interrupted:
+                    with JOBS_LOCK:
+                        job["partials"].pop(name, None)
+                    emit("file_reset", file=name, idx=idx)
+                    break
                 job["results"].append({"name": name, "status": "error", "error": str(e)})
                 emit("fail", file=name, msg=str(e))
             with JOBS_LOCK:
@@ -839,6 +965,8 @@ def run_job(job_id):
             emit("overall_progress", done=done, total=len(files))
     finally:
         translator.close()
+        with JOBS_LOCK:
+            job.pop("translator", None)
 
     job["current"] = ""
     job["finished_at"] = time.time()
@@ -1251,6 +1379,11 @@ class Handler(BaseHTTPRequestHandler):
                 j = JOBS.get(jid)
                 if j:
                     j["interrupt"] = True
+                    translator = j.get("translator")
+                else:
+                    translator = None
+            if translator:
+                translator.interrupt()
             self._send_json({"ok": bool(j)})
             return
         if path == "/api/prioritize":

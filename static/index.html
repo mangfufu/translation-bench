@@ -72,7 +72,7 @@
   #drop .big{font-weight:600;font-size:13px}#drop .small{color:var(--ink-faint);font-size:11px}#drop .small b{color:var(--verm)}
   #drop:hover .small,#drop.over .small,#drop:hover .small b,#drop.over .small b{color:#333}
   .task-actions{display:flex;gap:7px;margin-top:10px}.task-actions #btnGo{flex:1}.task-actions button{padding:7px 10px;font-size:12px;white-space:nowrap}
-  #progressBox{display:none;margin-top:10px}
+  #progressBox{display:block;margin-top:10px}
   .progress-head{display:flex;align-items:center;justify-content:space-between;margin:5px 0 3px;color:var(--ink-faint);font:9px var(--mono)}
   .progress-head b{color:var(--ink-soft);font-weight:500;font-variant-numeric:tabular-nums}
   .progress-track{height:5px;border:1px solid #4a4a4a;border-radius:0;background:#000;overflow:hidden}
@@ -596,7 +596,12 @@ async function addFiles(list){
   render();
   markOutputsDone();   // 标记后台已翻译过的文件
 }
-$('btnClear').addEventListener('click', () => { files=[]; selectedIdx=-1; render(); });
+$('btnClear').addEventListener('click', () => {
+  files=[]; selectedIdx=-1;
+  updateTotalProgress(0,0); updateFileProgress(0,0);
+  $('cur').textContent='';
+  render();
+});
 
 /* ---------- 渲染 ---------- */
 function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
@@ -1178,6 +1183,15 @@ function connectSSE(jid){
       }
     }catch(_){}
   });
+  es.addEventListener('file_reset', e => {
+    try{
+      const d = JSON.parse(e.data), fi = fileIdx(d.file);
+      if(fi >= 0){
+        files[fi].live_out={}; files[fi].legacy_out=''; files[fi].error='';
+        setChip(fi,'q'); render();
+      }
+    }catch(_){}
+  });
   es.addEventListener('progress', e => {
     try{
       const d = JSON.parse(e.data), fi = fileIdx(d.current);
@@ -1284,6 +1298,7 @@ $('btnStop').addEventListener('click', () => {
   if(!jobId) return;
   fetch('/api/interrupt', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({job:jobId})}).catch(()=>{});
   $('btnStop').disabled = true;
+  $('btnStop').textContent = '正在中断…';
 });
 $('btnTrack').addEventListener('click', () => {
   trackingProgress=!trackingProgress;
@@ -1352,12 +1367,19 @@ async function poll(forceFull=false){
     interrupted = (d.status === 'interrupted');
     localStorage.removeItem('bench_job'); localStorage.setItem('bench_lastjob', lastJob);
     applyResults(d.results);
+    if(interrupted){
+      files.forEach(f => {
+        if(f.status === 'run'){
+          f.status='q'; f.live_out={}; f.legacy_out=''; f.error='';
+        }
+      });
+    }
     currentName = ''; trackingProgress=false;
     $('btnStop').disabled = false;
+    $('btnStop').textContent = '中断';
     $('cur').textContent = interrupted ? '已中断（点「开始翻译」继续剩余文件）' : '全部完成';
     $('btnGo').disabled = files.length === 0;
     $('btnZip').disabled = !d.results.some(r => r.status==='ok');
-    setTimeout(()=> $('progressBox').style.display='none', 2000);
     render();
     if(!interrupted && queuedRetries.length) setTimeout(() => submitJob(queuedRetries), 0);
   }
@@ -1435,6 +1457,13 @@ async function reconnectJob(){
     applyPartials(d.partials); applyResults(d.results);
     if(d.status === 'done' || d.status === 'interrupted'){
       interrupted = d.status === 'interrupted'; lastJob = jid; jobId = null;
+      if(interrupted){
+        files.forEach(f => {
+          if(f.status === 'run'){
+            f.status='q'; f.live_out={}; f.legacy_out=''; f.error='';
+          }
+        });
+      }
       localStorage.removeItem('bench_job'); localStorage.setItem('bench_lastjob', jid);
       render(); return;
     }
