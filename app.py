@@ -47,6 +47,7 @@ DEFAULT_CONFIG = {
     "batch_paras": 15,            # 每批最多段落数
     "chunk_chars": 12000,         # 每批最多字符数
     "context_chars": 4000,        # 携带此前原文+译文作为术语/语气参考，0=关闭
+    "future_context_chars": 2000, # 携带后续原文作为消歧参考，0=关闭
     "max_retries": 5,
     "connection_max_requests": 32,  # 定期轮换 keep-alive，避开服务端连接寿命上限
     "src_lang": "自动判断",
@@ -235,7 +236,7 @@ class Translator:
             self.close()
             raise
 
-    def translate_text(self, text, context=""):
+    def translate_text(self, text, context_before="", context_after=""):
         """翻译一段文本, 返回 (成功, 结果/错误)。"""
         cfg = self.cfg
         extra_prompt = str(cfg.get("system_prompt", "") or "").strip()
@@ -248,7 +249,9 @@ class Translator:
             prompt_parts.append(f"【风格偏好（{style}）】\n{style_prompt}")
         sys_prompt = "\n\n".join(prompt_parts)
         est_out = len(text) // 2 + 40
-        est_in = (len(text) + len(context) + len(sys_prompt)) // 2 + 120
+        est_in = (
+            len(text) + len(context_before) + len(context_after) + len(sys_prompt)
+        ) // 2 + 160
         ctx = max(2048, int(cfg.get("context_size", 65536)))
         # 输出约为输入量级; 限制 max_tokens 防止模型跑偏时无限生成导致卡死
         available = ctx - est_in - 96
@@ -259,13 +262,21 @@ class Translator:
         tgt = cfg.get("tgt_lang", "中文")
         if src == "自动判断":
             src = detect_lang(text)
-        if context:
+        if context_before or context_after:
+            references = []
+            if context_before:
+                references.append(
+                    "【前文参考（原文及既有译文）】\n" + context_before
+                )
+            if context_after:
+                references.append(
+                    "【下文参考（尚未翻译的原文）】\n" + context_after
+                )
             prompt = (
-                "以下是前文及其既有译文，仅用于统一术语、称谓和语气：\n\n"
-                f"{context}\n\n"
-                f"参考上面的信息，把下面的{src}文本翻译成{tgt}。"
-                "不要翻译或输出上面的参考内容，只输出当前文本的译文：\n\n"
-                f"{text}"
+                "以下参考内容只用于理解语境、消除歧义并统一术语、称谓和语气。\n"
+                "只翻译【当前待译文本】，不得翻译、续写或输出任何前文和下文参考。\n\n"
+                + "\n\n".join(references)
+                + f"\n\n【当前待译文本（{src} → {tgt}）】\n{text}"
             )
         else:
             prompt = f"将以下{src}文本翻译为{tgt}，注意只需要输出翻译后的结果，不要额外解释：\n\n{text}"
@@ -325,18 +336,51 @@ class Translator:
             used += extra
         return "\n\n".join(reversed(blocks))
 
-    def translate_batch(self, paras, history=None):
+    def _future_context_text(self, sources):
+        """从当前批次之后的原文开头截取下文参考窗口。"""
+        limit = max(0, int(self.cfg.get("future_context_chars", 2000)))
+        if not sources or limit == 0:
+            return ""
+        blocks = []
+        used = 0
+        for source in sources:
+            source = str(source).strip()
+            if not source:
+                continue
+            separator = 2 if blocks else 0
+            remaining = limit - used - separator
+            if remaining <= 0:
+                break
+            if len(source) > remaining:
+                source = source[:remaining]
+            blocks.append(source)
+            used += separator + len(source)
+            if used >= limit:
+                break
+        return "\n\n".join(blocks)
+
+    def translate_batch(self, paras, history=None, future=None):
         """批翻译行；数量不匹配时逐行回退，保证一对一。"""
         history = list(history or [])
+        future = list(future or [])
         text = "\n\n".join(paras)
-        ok, out = self.translate_text(text, self._context_text(history))
+        ok, out = self.translate_text(
+            text,
+            self._context_text(history),
+            self._future_context_text(future),
+        )
         if ok:
             lines = [self._one_line(line) for line in out.splitlines() if line.strip()]
             if len(lines) == len(paras):
                 return True, lines
         res = []
-        for p in paras:
-            ok2, o2 = self.translate_text(p, self._context_text(history))
+        for pos, p in enumerate(paras):
+            line_future = paras[pos + 1:] + future
+            ok2, o2 = self.translate_text(
+                p,
+                self._context_text(history),
+                self._future_context_text(line_future),
+            )
             if not ok2:
                 return False, o2
             translated = self._one_line(o2)
@@ -416,9 +460,15 @@ class Translator:
         if progress:
             progress(0, len(translatable))
         history = []
-        for batch in self._batches(translatable):
+        batches = self._batches(translatable)
+        for batch_pos, batch in enumerate(batches):
             sources = [text for _, text in batch]
-            ok, trans = self.translate_batch(sources, history)
+            future_sources = [
+                text
+                for future_batch in batches[batch_pos + 1:]
+                for _, text in future_batch
+            ]
+            ok, trans = self.translate_batch(sources, history, future_sources)
             if not ok:
                 return False, trans
             for (idx, source), translated in zip(batch, trans):

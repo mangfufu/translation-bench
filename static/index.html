@@ -208,8 +208,10 @@
         <div><label>每批段落</label><input id="cfg_bp" type="number" value="15"></div>
         <div><label>每批字符</label><input id="cfg_cc" type="number" value="12000"></div>
       </div></div>
-      <div class="fld"><label>参考上文字符（0 为关闭）</label>
-        <input id="cfg_context_chars" type="number" min="0" step="500" value="4000"></div>
+      <div class="fld"><div class="row">
+        <div><label>参考上文字符</label><input id="cfg_context_chars" type="number" min="0" step="500" value="4000"></div>
+        <div><label>参考下文字符</label><input id="cfg_future_context_chars" type="number" min="0" step="500" value="2000"></div>
+      </div></div>
     </div>
     </div>
     <div class="config-actions">
@@ -315,7 +317,8 @@ function outputName(name, target){
 const CFG_FIELDS = {
   server:'cfg_server', key:'cfg_key', model:'cfg_model', ctx:'cfg_ctx',
   temp:'cfg_temp', topk:'cfg_topk', topp:'cfg_topp', rp:'cfg_rp',
-  src:'cfg_src', tgt:'cfg_tgt', style:'cfg_style', bp:'cfg_bp', cc:'cfg_cc', contextChars:'cfg_context_chars', sys:'cfg_sys'
+  src:'cfg_src', tgt:'cfg_tgt', style:'cfg_style', bp:'cfg_bp', cc:'cfg_cc', contextChars:'cfg_context_chars',
+  futureContextChars:'cfg_future_context_chars', sys:'cfg_sys'
 };
 const LEGACY_SYSTEM_PROMPTS = [
   '你是专业翻译。只输出译文，保持原意、语气和格式，不要添加任何解释。',
@@ -334,7 +337,8 @@ const LEGACY_SYSTEM_PROMPTS = [
 ];
 const CFG_DEFAULTS = {
   server:'http://127.0.0.1:8081', key:'', model:'hy-mt1.5-1.8b', ctx:65536,
-  temp:0.7, topk:20, topp:0.6, rp:1.05, src:'自动判断', tgt:'中文', style:'自动判断', bp:15, cc:12000, contextChars:4000,
+  temp:0.7, topk:20, topp:0.6, rp:1.05, src:'自动判断', tgt:'中文', style:'自动判断', bp:15, cc:12000,
+  contextChars:4000, futureContextChars:2000,
   sys:''
 };
 function readCfg(){
@@ -850,7 +854,8 @@ async function submitJob(subFiles){
   const payload = {
     config:{ server:cfg.server, api_key:cfg.key, model:cfg.model, context_size:+cfg.ctx,
       temperature:+cfg.temp, top_k:+cfg.topk, top_p:+cfg.topp, repeat_penalty:+cfg.rp,
-      batch_paras:+cfg.bp, chunk_chars:+cfg.cc, context_chars:+cfg.contextChars, src_lang:cfg.src, tgt_lang:cfg.tgt,
+      batch_paras:+cfg.bp, chunk_chars:+cfg.cc, context_chars:+cfg.contextChars,
+      future_context_chars:+cfg.futureContextChars, src_lang:cfg.src, tgt_lang:cfg.tgt,
       translation_style:cfg.style,
       system_prompt:cfg.sys },
     files: subFiles.map(f => ({name:f.name, content:f.content})),
