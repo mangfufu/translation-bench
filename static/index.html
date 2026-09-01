@@ -1,0 +1,1032 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>翻译工作台 · Translation Bench</title>
+<style>
+  :root{
+    color-scheme:dark;
+    --paper:#000;--paper-2:#090909;--panel:#050505;--panel-2:#0d0d0d;
+    --ink:#f5f5f5;--ink-soft:#b8b8b8;--ink-faint:#747474;--line:#292929;--line-2:#5a5a5a;
+    --verm:#fff;--verm-2:#d9d9d9;--verm-soft:#171717;--ok:#e7e7e7;--err:#fff;
+    --mono:"Cascadia Code","JetBrains Mono","SFMono-Regular",Consolas,monospace;
+    --sans:"Noto Sans SC","PingFang SC","Microsoft YaHei",-apple-system,sans-serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  *{scrollbar-width:thin;scrollbar-color:#777 #0a0a0a}
+  *::-webkit-scrollbar{width:10px;height:10px}
+  *::-webkit-scrollbar-track{background:#0a0a0a;border-left:1px solid #242424}
+  *::-webkit-scrollbar-thumb{background:#777;border:2px solid #0a0a0a;border-radius:0}
+  *::-webkit-scrollbar-thumb:hover{background:#fff}
+  *::-webkit-scrollbar-corner{background:#0a0a0a}
+  html,body{height:100%}
+  body{min-width:1180px;overflow:hidden;font:14px/1.55 var(--sans);color:var(--ink);background:var(--paper);-webkit-font-smoothing:antialiased}
+  button,input,select{font:inherit}
+  button{border:1px solid var(--line-2);border-radius:0;background:#080808;color:var(--ink);padding:8px 13px;cursor:pointer;transition:background .1s linear,color .1s linear,border-color .1s linear}
+  button:hover:not(:disabled){border-color:#fff;background:#fff;color:#000}
+  button:focus-visible,input:focus-visible,select:focus-visible{outline:1px solid #fff;outline-offset:2px}
+  button:disabled{opacity:.3;cursor:not-allowed}
+  button[hidden]{display:none!important}
+  button.primary{background:#fff;border-color:#fff;color:#000;font-weight:700}
+  button.primary:hover:not(:disabled){background:#bfbfbf;border-color:#bfbfbf;color:#000}
+  button.danger{color:#fff;border-color:#fff;background:#000}
+  button.quiet{border-color:var(--line);background:#000;color:var(--ink-soft)}
+  button.on{background:#fff;border-color:#fff;color:#000}
+
+  header{height:58px;display:flex;align-items:center;justify-content:space-between;padding:0 20px;border-bottom:1px solid #fff;background:#000}
+  .brand h1{font:700 18px/1 var(--sans);letter-spacing:.12em}
+  .srv{display:flex;align-items:center;gap:8px;color:var(--ink-soft);font:12px var(--mono)}
+  .dot{width:8px;height:8px;border-radius:0;background:#555}
+  .dot.on{background:#fff}.dot.err{background:#fff;outline:1px solid #fff;outline-offset:2px}.dot.busy{background:#fff;animation:blink 1s steps(1) infinite}
+  @keyframes blink{50%{opacity:.3}}
+
+  main{--config-w:280px;--queue-w:360px;height:calc(100vh - 58px);display:grid;grid-template-columns:var(--config-w) 6px var(--queue-w) 6px minmax(520px,1fr);overflow:hidden;background:#000}
+  .config-panel,.queue-panel,.detail-panel{min-width:0;min-height:0;background:var(--panel);contain:layout paint}
+  .config-panel{display:flex;flex-direction:column}
+  .splitter{position:relative;background:#1c1c1c;border-left:1px solid #333;border-right:1px solid #333;cursor:col-resize;z-index:5;touch-action:none;transition:background .1s linear}
+  .splitter:hover,.splitter.dragging{background:#fff;border-color:#fff}
+  body.resizing{cursor:col-resize;user-select:none}
+  .panel-head{height:50px;flex:none;display:flex;align-items:center;justify-content:space-between;padding:0 16px;border-bottom:1px solid var(--line-2);background:#050505}
+  .panel-head h2{font-size:13px;font-weight:700;letter-spacing:.08em}.panel-head .sub{font:10px var(--mono);color:var(--ink-faint)}
+  .config-scroll{flex:1;min-height:0;overflow:auto;padding:12px 12px 2px;scrollbar-gutter:stable}
+  .sec{border:1px solid var(--line);border-radius:0;background:var(--panel-2);margin-bottom:10px;overflow:hidden}
+  .sec>h3{padding:8px 10px;border-bottom:1px solid var(--line);background:#050505;color:var(--ink-soft);font:10px var(--mono);letter-spacing:.14em;text-transform:uppercase}
+  .fld{padding:8px 11px;border-bottom:1px solid var(--line)}.fld:last-child{border-bottom:0}
+  .fld label{display:block;margin-bottom:4px;color:var(--ink-soft);font-size:11px}
+  .fld input,.fld select,.fld textarea{width:100%;min-width:0;border:1px solid #3a3a3a;border-radius:0;outline:0;background:#000;color:#fff;padding:7px 8px;font:12px var(--mono)}
+  .fld input:focus,.fld select:focus,.fld textarea:focus{border-color:#fff;box-shadow:none}
+  .fld textarea{display:block;min-height:82px;resize:vertical;line-height:1.6}
+  .fld .row{display:flex;gap:8px}.fld .row>div{flex:1;min-width:0}
+  .config-actions{flex:none;display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:10px 12px;border-top:1px solid var(--line-2);background:#050505}
+  .config-actions button{font-size:12px}
+
+  .queue-panel{display:flex;flex-direction:column}
+  .queue-head .count{padding:2px 6px;border:1px solid var(--line-2);border-radius:0;background:#000;color:var(--ink-soft);font:10px var(--mono)}
+  .queue-controls{flex:none;padding:12px;border-bottom:1px solid var(--line-2);background:#090909}
+  #drop{padding:13px;border:1px dashed var(--line-2);border-radius:0;text-align:center;background:#000;cursor:pointer;transition:.1s linear}
+  #drop:hover,#drop.over{border-color:#fff;background:#fff;color:#000}
+  #drop .big{font-weight:600;font-size:13px}#drop .small{color:var(--ink-faint);font-size:11px}#drop .small b{color:var(--verm)}
+  #drop:hover .small,#drop.over .small,#drop:hover .small b,#drop.over .small b{color:#333}
+  .task-actions{display:flex;gap:7px;margin-top:10px}.task-actions #btnGo{flex:1}.task-actions button{padding:7px 10px;font-size:12px;white-space:nowrap}
+  #progressBox{display:none;margin-top:10px}
+  .progress-head{display:flex;align-items:center;justify-content:space-between;margin:5px 0 3px;color:var(--ink-faint);font:9px var(--mono)}
+  .progress-head b{color:var(--ink-soft);font-weight:500;font-variant-numeric:tabular-nums}
+  .progress-track{height:5px;border:1px solid #4a4a4a;border-radius:0;background:#000;overflow:hidden}
+  .progress-track>i{display:block;width:0;height:100%;background:#fff;transition:width .15s linear}
+  #fileBar>i{background:#aaa}
+  #cur{min-height:17px;margin-top:6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--ink-faint);font:10px var(--mono)}
+  #list{flex:1;min-height:0;overflow:auto;padding:0;display:flex;flex-direction:column;gap:0;scrollbar-gutter:stable;overflow-anchor:none;background:#000}
+  .file{display:grid;grid-template-columns:30px auto auto minmax(0,1fr) auto;align-items:center;gap:8px;padding:10px 9px;border:0;border-bottom:1px solid var(--line);border-radius:0;cursor:pointer;background:#000}
+  .file:hover{background:#121212}.file.selected{border-color:#fff;background:#fff;color:#000;box-shadow:none}
+  .file.current:not(.selected){background:#171717;border-left:4px solid #fff;padding-left:5px}
+  .file .seq{color:var(--ink-faint);text-align:right;font:10px var(--mono);font-variant-numeric:tabular-nums;user-select:none}
+  .file.selected .seq,.file.selected .nm{color:#000}
+  .file .nm{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px}
+  .file .meta{display:none}.file .err{grid-column:4/-1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--err);font-size:10px}
+  .st{font:9px var(--mono);letter-spacing:.05em;padding:2px 5px;border:1px solid #555;border-radius:0;white-space:nowrap;background:#000;color:#aaa}
+  .st.run{background:#fff;color:#000;border-color:#fff}.st.ok{background:#252525;color:#fff;border-color:#777}.st.err{background:#000;color:#fff;border-color:#fff}
+  .file.selected .st{background:#fff;color:#000;border-color:#000}.file.selected .st.run{background:#000;color:#fff}.file.selected .err{color:#000}
+  .file .pri{border:0;background:transparent;padding:3px;line-height:1;opacity:.35}.file .pri:hover{opacity:1;background:#fff;color:#000}.file .pri.on{opacity:1;color:#fff}.file.selected .pri{color:#000}.file .pri svg{width:13px;height:13px;display:block}
+  .file .dl{border:0;background:transparent;padding:2px;color:var(--verm);font:10px var(--mono);text-decoration:underline}
+  .file .retry{width:26px;height:26px;padding:5px;display:inline-flex;align-items:center;justify-content:center;color:var(--err);background:transparent;border-color:transparent}
+  .file .retry:hover:not(:disabled){border-color:#fff;background:#fff;color:#000}.file .retry svg{width:14px;height:14px}
+  .file .retry.queued{color:#fff;border-color:#fff;background:#222}
+  .queue-foot{flex:none;padding:8px 12px;border-top:1px solid var(--line-2);color:var(--ink-faint);font:10px var(--mono);background:#050505}
+
+  .detail-panel{display:flex;flex-direction:column;background:var(--paper)}
+  .detail-head{height:50px;flex:none;display:flex;align-items:center;gap:12px;padding:0 16px;border-bottom:1px solid var(--line-2);background:#050505}
+  .detail-title{flex:1;min-width:0}.detail-title strong{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px}.detail-title span{display:block;color:var(--ink-faint);font:10px var(--mono)}
+  .detail-actions{display:flex;gap:7px}.detail-actions button{padding:6px 10px;font-size:11px;display:inline-flex;align-items:center;gap:6px}
+  #detail{flex:1;min-height:0;overflow:hidden;padding:0}
+  .detail-empty{height:100%;display:grid;place-items:center;border:0;border-radius:0;color:var(--ink-faint);text-align:center;background:#000}.detail-empty strong{display:block;color:var(--ink-soft);font:600 15px var(--sans);margin-bottom:4px}
+  .compare-wrap{--source-w:50%;position:relative;height:100%}
+  .split{height:100%;overflow:auto;border:0;border-radius:0;background:#000;scrollbar-gutter:stable}
+  .compare-splitter{position:absolute;z-index:4;top:0;bottom:0;left:var(--source-w);width:6px;transform:translateX(-3px);cursor:col-resize;touch-action:none;will-change:transform;background:#333;border-left:1px solid #555;border-right:1px solid #555;transition:background .1s linear}
+  .compare-splitter:hover,.compare-splitter.dragging{background:#fff;border-color:#fff}
+  .shead{position:sticky;top:0;z-index:2;display:grid;grid-template-columns:var(--source-w) minmax(0,1fr);background:#0b0b0b;border-bottom:1px solid var(--line-2);color:var(--ink-soft);font:10px var(--mono);letter-spacing:.14em}
+  .shead span{padding:9px 12px}.shead span:last-child{border-left:1px solid var(--line)}
+  .srow{display:grid;grid-template-columns:var(--source-w) minmax(0,1fr);border-bottom:1px solid #1e1e1e}
+  .srow:last-child{border-bottom:0}.srow:nth-child(odd){background:#070707}
+  .srow .scell,.srow .dcell{min-width:0;padding:10px 12px;font-size:12px;line-height:1.75;white-space:pre-wrap;word-break:break-word}
+  .srow .scell{color:#a8a8a8}.srow .dcell{border-left:1px solid var(--line);color:#fff}
+  .srow .empty{color:var(--ink-faint);font-style:italic}
+  .empty{padding:28px 10px;text-align:center;color:var(--ink-faint);font-size:12px}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand">
+    <h1>翻译工作台</h1>
+  </div>
+  <div class="srv">
+    <span class="dot" id="dot"></span><span id="srvTxt">检测服务器…</span>
+  </div>
+</header>
+
+<main>
+  <!-- 配置 -->
+  <aside class="config-panel">
+    <div class="panel-head"><h2>配置</h2><span class="sub">CONFIG</span></div>
+    <div class="config-scroll">
+    <div class="sec">
+      <h3>模型 · 服务</h3>
+      <div class="fld"><label>服务地址</label>
+        <input id="cfg_server" placeholder="http://127.0.0.1:8081"></div>
+      <div class="fld"><label>API 密钥</label>
+        <input id="cfg_key" type="password" autocomplete="off" placeholder="未启用鉴权时留空"></div>
+      <div class="fld"><label>模型名</label>
+        <input id="cfg_model" placeholder="hy-mt1.5-1.8b"></div>
+      <div class="fld"><label>上下文长度</label>
+        <input id="cfg_ctx" type="number" min="2048" step="1024" value="65536"></div>
+    </div>
+
+    <div class="sec">
+      <h3>采样 · 生成</h3>
+      <div class="fld"><div class="row">
+        <div><label>temperature</label><input id="cfg_temp" type="number" step="0.05" value="0.7"></div>
+        <div><label>top_k</label><input id="cfg_topk" type="number" value="20"></div>
+      </div></div>
+      <div class="fld"><div class="row">
+        <div><label>top_p</label><input id="cfg_topp" type="number" step="0.05" value="0.6"></div>
+        <div><label>repeat_penalty</label><input id="cfg_rp" type="number" step="0.05" value="1.05"></div>
+      </div></div>
+    </div>
+
+    <div class="sec">
+      <h3>翻译 · 分块</h3>
+      <div class="fld"><label>补充要求（可选）</label>
+        <textarea id="cfg_sys" rows="4" placeholder="例如：特定人名保持原文，术语按指定译法"></textarea></div>
+      <div class="fld"><label>翻译风格</label>
+        <select id="cfg_style">
+          <option selected>自动判断</option>
+          <option>通用自然</option>
+          <option>剧情文学</option>
+          <option>专业技术</option>
+          <option>对话字幕</option>
+          <option>正式商务</option>
+          <option>学术论文</option>
+          <option>轻小说网文</option>
+        </select></div>
+      <div class="fld"><div class="row">
+        <div><label>源语言</label>
+          <select id="cfg_src">
+            <option>自动判断</option>
+            <option>中文</option><option>繁体中文</option><option>粤语</option><option>藏文</option>
+            <option>英文</option><option>法文</option><option>西班牙文</option><option>葡萄牙文</option>
+            <option>德文</option><option>意大利文</option><option>荷兰文</option><option>瑞典文</option>
+            <option>波兰文</option><option>捷克文</option><option>斯洛伐克文</option><option>斯洛文尼亚文</option>
+            <option>克罗地亚文</option><option>塞尔维亚文</option><option>罗马尼亚文</option><option>匈牙利文</option>
+            <option>保加利亚文</option><option>乌克兰文</option><option>希腊文</option><option>立陶宛文</option>
+            <option>俄文</option><option>韩文</option><option>泰文</option><option>越南文</option>
+            <option>马来文</option><option>印尼文</option><option>菲律宾文</option><option>印地文</option>
+            <option>孟加拉文</option><option>乌尔都文</option><option>泰米尔文</option><option>泰卢固文</option>
+            <option>马拉地文</option><option>古吉拉特文</option><option>阿拉伯文</option><option>希伯来文</option>
+            <option>波斯文</option><option>高棉文</option><option>缅甸文</option><option>哈萨克文</option>
+            <option>蒙古文</option><option>维吾尔文</option>
+            <option>日文</option>
+          </select></div>
+        <div><label>目标语言</label>
+          <select id="cfg_tgt">
+            <option selected>中文</option><option>繁体中文</option><option>粤语</option><option>藏文</option>
+            <option>英文</option><option>法文</option><option>西班牙文</option><option>葡萄牙文</option>
+            <option>德文</option><option>意大利文</option><option>荷兰文</option><option>瑞典文</option>
+            <option>波兰文</option><option>捷克文</option><option>斯洛伐克文</option><option>斯洛文尼亚文</option>
+            <option>克罗地亚文</option><option>塞尔维亚文</option><option>罗马尼亚文</option><option>匈牙利文</option>
+            <option>保加利亚文</option><option>乌克兰文</option><option>希腊文</option><option>立陶宛文</option>
+            <option>俄文</option><option>韩文</option><option>泰文</option><option>越南文</option>
+            <option>马来文</option><option>印尼文</option><option>菲律宾文</option><option>印地文</option>
+            <option>孟加拉文</option><option>乌尔都文</option><option>泰米尔文</option><option>泰卢固文</option>
+            <option>马拉地文</option><option>古吉拉特文</option><option>阿拉伯文</option><option>希伯来文</option>
+            <option>波斯文</option><option>高棉文</option><option>缅甸文</option><option>哈萨克文</option>
+            <option>蒙古文</option><option>维吾尔文</option>
+            <option>日文</option>
+          </select></div>
+      </div></div>
+      <div class="fld"><div class="row">
+        <div><label>每批段落</label><input id="cfg_bp" type="number" value="15"></div>
+        <div><label>每批字符</label><input id="cfg_cc" type="number" value="12000"></div>
+      </div></div>
+      <div class="fld"><label>参考上文字符（0 为关闭）</label>
+        <input id="cfg_context_chars" type="number" min="0" step="500" value="4000"></div>
+    </div>
+    </div>
+    <div class="config-actions">
+      <button id="btnTest">测试连接</button>
+      <button id="btnSave">保存配置</button>
+    </div>
+  </aside>
+
+  <div class="splitter" data-split="config" title="拖动调整配置栏宽度"></div>
+
+  <!-- 任务队列 -->
+  <section class="queue-panel">
+    <div class="panel-head queue-head">
+      <h2>翻译任务</h2><span class="count" id="count">0 个文件</span>
+    </div>
+    <div class="queue-controls">
+      <div id="drop">
+        <div class="big">添加文档</div>
+        <div class="small">拖入或<b>选择文件</b> · .md / .txt</div>
+      </div>
+      <div class="task-actions">
+        <button class="primary" id="btnGo" disabled>开始翻译</button>
+        <button class="danger" id="btnStop" hidden>中断</button>
+        <button id="btnZip" hidden>下载 ZIP</button>
+        <button class="quiet" id="btnClear" disabled>清空</button>
+      </div>
+      <div id="progressBox">
+        <div class="progress-head"><span>总进度</span><b id="totalPct">0%</b></div>
+        <div class="progress-track" id="bar"><i></i></div>
+        <div class="progress-head"><span>当前文件进度</span><b id="filePct">0%</b></div>
+        <div class="progress-track" id="fileBar"><i></i></div>
+      </div>
+      <div id="cur"></div>
+    </div>
+    <div id="list"><div class="empty">尚未添加文档</div></div>
+    <div class="queue-foot">结果自动保存至 outputs\</div>
+  </section>
+
+  <div class="splitter" data-split="queue" title="拖动调整任务栏宽度"></div>
+
+  <!-- 原文 / 译文 -->
+  <section class="detail-panel">
+    <div class="detail-head">
+      <div class="detail-title">
+        <strong id="detailName">原文 / 译文</strong>
+        <span id="detailMeta">选择中间栏中的文件查看内容</span>
+      </div>
+      <div class="detail-actions"><button id="btnTrack" disabled>跟随翻译进度</button></div>
+    </div>
+    <div id="detail">
+      <div class="detail-empty"><div><strong>尚未选择文件</strong><span>从任务列表中选择一项查看对照</span></div></div>
+    </div>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+let files = [];       // {name, content, status, error, content_out, live_out, legacy_out, output_name}
+let jobId = null, lastJob = null, pollTimer = null, es = null, submitting = false;
+let jobNames = [], interrupted = false;
+let selectedIdx = -1, currentName = '', trackingProgress = false;
+let compareRatio = 50;
+let pollBusy = false;
+let taskListScrollTop = 0;
+$('list').addEventListener('scroll', () => { taskListScrollTop = $('list').scrollTop; }, {passive:true});
+function updateTotalProgress(done=0, total=0){
+  const pct = total ? Math.round(done/total*100) : 0;
+  $('bar').firstElementChild.style.width = pct + '%';
+  $('totalPct').textContent = total ? `${pct}% · ${done}/${total}` : '0%';
+}
+function updateFileProgress(done=0, total=0, complete=false){
+  const pct = total ? Math.round(done/total*100) : (complete ? 100 : 0);
+  $('fileBar').firstElementChild.style.width = pct + '%';
+  $('filePct').textContent = total ? `${pct}% · ${done}/${total}` : (complete ? '100% · 无需翻译' : '0%');
+}
+function fileIdx(name){ return files.findIndex(f => f.name === name); }
+function unfinishedFiles(){
+  const target = $('cfg_tgt') ? $('cfg_tgt').value : '中文';
+  return files.filter(f => typeof f.content === 'string' &&
+    (f.status === 'err' || f.content_out === null || f.target_language !== target));
+}
+
+const LANG_SUFFIXES = {
+  '中文':'zh','繁体中文':'zh-hant','粤语':'yue','藏文':'bo','英文':'en','法文':'fr',
+  '西班牙文':'es','葡萄牙文':'pt','德文':'de','意大利文':'it','荷兰文':'nl','瑞典文':'sv',
+  '波兰文':'pl','捷克文':'cs','斯洛伐克文':'sk','斯洛文尼亚文':'sl','克罗地亚文':'hr',
+  '塞尔维亚文':'sr','罗马尼亚文':'ro','匈牙利文':'hu','保加利亚文':'bg',
+  '乌克兰文':'uk','希腊文':'el','立陶宛文':'lt','俄文':'ru','韩文':'ko','泰文':'th',
+  '越南文':'vi','马来文':'ms','印尼文':'id','菲律宾文':'fil','印地文':'hi','孟加拉文':'bn',
+  '乌尔都文':'ur','泰米尔文':'ta','泰卢固文':'te','马拉地文':'mr','古吉拉特文':'gu',
+  '阿拉伯文':'ar','希伯来文':'he','波斯文':'fa','高棉文':'km','缅甸文':'my','哈萨克文':'kk',
+  '蒙古文':'mn','维吾尔文':'ug','日文':'ja'
+};
+function outputName(name, target){
+  const clean = String(name).replace(/\\/g,'/').split('/').pop() || 'translated.md';
+  const dot = clean.lastIndexOf('.');
+  const base = dot > 0 ? clean.slice(0,dot) : clean;
+  const ext = dot > 0 ? clean.slice(dot) : '.md';
+  return `${base}.${LANG_SUFFIXES[target] || 'translated'}${ext}`;
+}
+
+/* ---------- 配置读写 ---------- */
+const CFG_FIELDS = {
+  server:'cfg_server', key:'cfg_key', model:'cfg_model', ctx:'cfg_ctx',
+  temp:'cfg_temp', topk:'cfg_topk', topp:'cfg_topp', rp:'cfg_rp',
+  src:'cfg_src', tgt:'cfg_tgt', style:'cfg_style', bp:'cfg_bp', cc:'cfg_cc', contextChars:'cfg_context_chars', sys:'cfg_sys'
+};
+const LEGACY_SYSTEM_PROMPTS = [
+  '你是专业翻译。只输出译文，保持原意、语气和格式，不要添加任何解释。',
+  `你是专业文档翻译引擎。忠实、完整、自然地翻译，不得省略、概括、增补或解释。
+严格遵守：
+1. 只输出译文，不输出说明、标签或原文。
+2. 输入有多行时逐行对应输出，行数和顺序必须一致；单行译文内部不要换行。
+3. 结合参考上下文统一术语、专名、称谓和语气，但不得重复输出参考内容。
+4. 原样保留 URL、行内代码、变量、占位符、数字及 Markdown 行内标记。`,
+  `你是专业文档翻译引擎。忠实、完整地翻译，不得省略、概括、捏造内容或额外解释；允许在不改变事实、情节和含义的前提下，按指定风格调整措辞。
+严格遵守：
+1. 只输出译文，不输出说明、标签或原文。
+2. 输入有多行时逐行对应输出，行数和顺序必须一致；单行译文内部不要换行。
+3. 结合参考上下文统一术语、专名、称谓和语气，但不得重复输出参考内容。
+4. 原样保留 URL、行内代码、变量、占位符、数字及 Markdown 行内标记。`
+];
+const CFG_DEFAULTS = {
+  server:'http://127.0.0.1:8081', key:'', model:'hy-mt1.5-1.8b', ctx:65536,
+  temp:0.7, topk:20, topp:0.6, rp:1.05, src:'自动判断', tgt:'中文', style:'自动判断', bp:15, cc:12000, contextChars:4000,
+  sys:''
+};
+function readCfg(){
+  const c = {};
+  for(const k in CFG_FIELDS) c[k] = $(CFG_FIELDS[k]).value;
+  return c;
+}
+function writeCfg(c){
+  for(const k in CFG_FIELDS) $(CFG_FIELDS[k]).value = c[k] ?? CFG_DEFAULTS[k];
+}
+try{
+  const savedCfg = JSON.parse(localStorage.getItem('bench_cfg'));
+  if(savedCfg){
+    if(Number(savedCfg.ctx) === 131072) savedCfg.ctx = 65536;
+    if(Number(savedCfg.cc) === 8000) savedCfg.cc = 12000;
+    // v3 将系统硬性规则彻底移入后端。首次加载新版时无条件清掉旧输入框内容，
+    // 避免旧提示词因换行、空格或字符差异被误当成用户补充要求；此后新填写的内容正常保留。
+    if(localStorage.getItem('bench_prompt_migration') !== '3'){
+      savedCfg.sys = '';
+      localStorage.setItem('bench_prompt_migration', '3');
+    }else if(savedCfg.sys == null || LEGACY_SYSTEM_PROMPTS.includes(savedCfg.sys)){
+      savedCfg.sys = '';
+    }
+    localStorage.setItem('bench_cfg', JSON.stringify(savedCfg));
+  }
+  writeCfg(savedCfg);
+}catch(e){ writeCfg(CFG_DEFAULTS); }
+
+/* ---------- 可调三栏宽度 ---------- */
+const workspace = document.querySelector('main');
+function clamp(n, min, max){ return Math.max(min, Math.min(max, n)); }
+function calculateLayout(configWidth, queueWidth, total=workspace.clientWidth){
+  const configMax = Math.max(220, Math.min(420, total - 280 - 12 - 520));
+  const cfg = clamp(Number(configWidth)||280, 220, configMax);
+  const queueMax = Math.max(280, total - cfg - 12 - 520);
+  const queue = clamp(Number(queueWidth)||360, 280, Math.min(560, queueMax));
+  return {config:cfg, queue};
+}
+function applyLayout(configWidth, queueWidth, save=false){
+  const size=calculateLayout(configWidth, queueWidth);
+  const cfg=size.config, queue=size.queue;
+  workspace.style.setProperty('--config-w', cfg + 'px');
+  workspace.style.setProperty('--queue-w', queue + 'px');
+  if(save) localStorage.setItem('bench_layout', JSON.stringify({config:cfg, queue}));
+}
+try{
+  const layout = JSON.parse(localStorage.getItem('bench_layout')) || {};
+  applyLayout(layout.config, layout.queue);
+}catch(_){ applyLayout(280,360); }
+compareRatio = clamp(parseFloat(localStorage.getItem('bench_compare_ratio')) || 50, 25, 75);
+document.querySelectorAll('.splitter').forEach(handle => {
+  handle.addEventListener('pointerdown', e => {
+    e.preventDefault(); handle.setPointerCapture(e.pointerId); handle.classList.add('dragging');
+    document.body.classList.add('resizing');
+    const startX = e.clientX;
+    const styles = getComputedStyle(workspace);
+    const startConfig = parseFloat(styles.getPropertyValue('--config-w'));
+    const startQueue = parseFloat(styles.getPropertyValue('--queue-w'));
+    const total=workspace.clientWidth;
+    let latestX=startX, frame=0, targetConfig=startConfig, targetQueue=startQueue;
+    const preview = () => {
+      frame=0;
+      const delta=latestX-startX;
+      if(handle.dataset.split === 'config'){
+        const maxConfig=Math.max(220,Math.min(420,total-startQueue-12-520));
+        targetConfig=clamp(startConfig+delta,220,maxConfig);
+        targetQueue=startQueue;
+      }else{
+        const maxQueue=Math.max(280,Math.min(560,total-startConfig-12-520));
+        targetConfig=startConfig;
+        targetQueue=clamp(startQueue+delta,280,maxQueue);
+      }
+      workspace.style.setProperty('--config-w', targetConfig + 'px');
+      workspace.style.setProperty('--queue-w', targetQueue + 'px');
+    };
+    const move = ev => {
+      latestX=ev.clientX;
+      if(!frame) frame=requestAnimationFrame(preview);
+    };
+    const up = () => {
+      if(frame){ cancelAnimationFrame(frame); preview(); }
+      handle.classList.remove('dragging'); document.body.classList.remove('resizing');
+      handle.removeEventListener('pointermove', move); handle.removeEventListener('pointerup', up);
+      handle.removeEventListener('pointercancel', up);
+      applyLayout(targetConfig,targetQueue,true);
+    };
+    handle.addEventListener('pointermove', move); handle.addEventListener('pointerup', up);
+    handle.addEventListener('pointercancel', up);
+  });
+});
+window.addEventListener('resize', () => {
+  const styles = getComputedStyle(workspace);
+  applyLayout(parseFloat(styles.getPropertyValue('--config-w')), parseFloat(styles.getPropertyValue('--queue-w')));
+});
+
+/* ---------- 服务器状态 ---------- */
+async function ping(){
+  const dot = $('dot'), txt = $('srvTxt');
+  dot.className='dot busy'; txt.textContent='检测中…';
+  try{
+    const srv = $('cfg_server').value.trim();
+    const r = await fetch('/api/test?server=' + encodeURIComponent(srv));
+    const d = await r.json();
+    if(d.ok){ dot.className='dot on'; txt.textContent='服务器在线 · ' + d.msg.slice(0,60); }
+    else{ dot.className='dot err'; txt.textContent='连接失败 · ' + d.msg.slice(0,80); }
+  }catch(e){ dot.className='dot err'; txt.textContent='无法连接后端'; }
+}
+ping();
+
+/* ---------- 文件添加 ---------- */
+$('drop').addEventListener('click', () => {
+  const inp = document.createElement('input'); inp.type='file'; inp.multiple=true;
+  inp.accept='.md,.txt,.text,.markdown';
+  inp.onchange = () => addFiles([...inp.files]);
+  inp.click();
+});
+['dragover','dragenter'].forEach(ev => $('drop').addEventListener(ev, e => {
+  e.preventDefault(); $('drop').classList.add('over');
+}));
+['dragleave','drop'].forEach(ev => $('drop').addEventListener(ev, e => {
+  e.preventDefault(); $('drop').classList.remove('over');
+}));
+$('drop').addEventListener('drop', e => addFiles([...e.dataTransfer.files]));
+
+async function addFiles(list){
+  for(const f of list){
+    if(files.some(x => x.name === f.name)) continue;
+    const content = await f.text();
+    files.push({name:f.name, content, status:'q', error:'', content_out:null,
+      live_out:{}, legacy_out:'', output_name:null, target_language:null, priority:false, retry_queued:false});
+  }
+  if(selectedIdx < 0 && files.length) selectedIdx = 0;
+  render();
+  markOutputsDone();   // 标记后台已翻译过的文件
+}
+$('btnClear').addEventListener('click', () => { files=[]; selectedIdx=-1; render(); });
+
+/* ---------- 渲染 ---------- */
+function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function escAttr(s){ return esc(s).replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
+
+function splitHtml(i){
+  const f = files[i];
+  if(!f) return '';
+  // 使用物理行号对齐，SSE 乱序/重连时也不会把译文配到错行。
+  const src = typeof f.content === 'string' ? f.content.split('\n') : [];
+  const completed = f.content_out !== null;
+  const dst = completed ? String(f.content_out).split('\n') : [];
+  const live = f.live_out || {};
+  // 兼容修复前已在运行的后端：旧 chunk 没有物理行号，按非空行顺序对齐。
+  const legacy = {};
+  if(!completed && !Object.keys(live).length && f.legacy_out){
+    const sourceRows = src.map((line, idx) => line.trim() ? idx : -1).filter(idx => idx >= 0);
+    String(f.legacy_out).split('\n').filter(line => line.trim()).forEach((line, idx) => {
+      const targetRow = sourceRows[idx] !== undefined ? sourceRows[idx] : idx;
+      legacy[targetRow] = line;
+    });
+  }
+  let rows = '<div class="shead"><span>原文</span><span>译文</span></div>';
+  const n = Math.max(src.length, dst.length,
+    ...Object.keys(live).map(Number).map(x=>x+1),
+    ...Object.keys(legacy).map(Number).map(x=>x+1), 0);
+  for(let k=0;k<n;k++){
+    const s = src[k] || '';
+    const d = completed ? (dst[k] || '') : (live[k] || legacy[k] || '');
+    if(!s.trim() && !d.trim()) continue;
+    rows += `<div class="srow" data-line="${k}"><div class="scell${s?'':' empty'}">${esc(s)||'…'}</div><div class="dcell${d?'':' empty'}">${esc(d)||'…'}</div></div>`;
+  }
+  return rows;
+}
+
+function render(){
+  if(selectedIdx < 0 && files.length) selectedIdx = 0;
+  if(selectedIdx >= files.length) selectedIdx = files.length - 1;
+  $('count').textContent = files.length + ' 个文件';
+  const runnable = unfinishedFiles();
+  const failedRunnable = runnable.filter(f => f.status === 'err');
+  const runnableSet = new Set(runnable);
+  $('btnGo').disabled = files.length === 0 || submitting || (jobId !== null) || runnable.length === 0;
+  $('btnGo').textContent = submitting ? '正在启动' : (jobId ? '翻译中'
+    : (failedRunnable.length === runnable.length && failedRunnable.length
+      ? `重试失败（${failedRunnable.length}）`
+      : (failedRunnable.length ? `继续并重试（${runnable.length}）` : '开始翻译')));
+  $('btnStop').hidden = !jobId;
+  $('btnZip').hidden = !lastJob;
+  $('btnClear').disabled = files.length === 0 || !!jobId;
+  $('btnTrack').disabled = !jobId || !currentName;
+  $('btnTrack').classList.toggle('on', trackingProgress);
+  $('btnTrack').textContent = trackingProgress ? '停止跟随' : '跟随翻译进度';
+  const list = $('list');
+  if(files.length === 0){
+    taskListScrollTop = 0;
+    list.innerHTML='<div class="empty">尚未添加文档</div>';
+    list.scrollTop = 0;
+    renderDetail(); persist(); return;
+  }
+  const savedScrollTop = list.scrollTop || taskListScrollTop;
+  list.innerHTML = files.map((f,i) => {
+    const stMap = {q:['待译','q'], run:['翻译中','run'], ok:['完成','ok'], err:['失败','err']};
+    const [label, cls] = stMap[f.status] || ['待译','q'];
+    const dl = f.status==='ok' && f.content_out !== null ? `<button class="dl" data-i="${i}">下载</button>` : '';
+    const retryDisabled = typeof f.content !== 'string';
+    const retryTitle = retryDisabled ? '原文未保留，请重新添加文件'
+      : (jobId ? (f.retry_queued ? '已加入批次结束后的重试队列，点击取消' : '当前批次结束后自动重试') : '重试该文件');
+    const retry = f.status==='err' ? `<button class="retry${f.retry_queued?' queued':''}" data-i="${i}" title="${retryTitle}" aria-label="重试该文件" ${retryDisabled?'disabled':''}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6v5h-5"/><path d="M18.2 15a7 7 0 1 1-.7-7.8L20 11"/></svg></button>` : '';
+    const err = f.error ? `<span class="err">${esc(f.error)}</span>` : '';
+    const canPrioritize = runnableSet.has(f) && f.name !== currentName && (!jobId || f.status === 'q');
+    const priorityTitle = jobId ? '安排为当前任务的下一个任务' : '移动到队列最前';
+    const classes = ['file', i===selectedIdx?'selected':'', f.name===currentName?'current':''].filter(Boolean).join(' ');
+    return `<div class="${classes}" data-fi="${i}">
+      <span class="seq" aria-label="任务序号 ${i+1}">${i+1}</span>
+      <button class="pri${f.priority?' on':''}" data-i="${i}" title="${priorityTitle}" aria-label="${priorityTitle}" ${canPrioritize?'':'disabled'}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m17 11-5-5-5 5M17 18l-5-5-5 5"/></svg></button>
+      <span class="st ${cls}">${label}</span>
+      <span class="nm" title="${escAttr(f.name)}">${esc(f.name)}</span>
+      ${dl}${retry}${err}
+    </div>`;
+  }).join('');
+  list.querySelectorAll('.file').forEach(row => row.onclick = () => selectFile(+row.dataset.fi));
+  list.querySelectorAll('.dl').forEach(b => b.onclick = e => { e.stopPropagation(); download(b.dataset.i); });
+  list.querySelectorAll('.retry').forEach(b => b.onclick = e => {
+    e.stopPropagation(); if(!b.disabled) retryFile(+b.dataset.i);
+  });
+  list.querySelectorAll('.pri').forEach(b => b.onclick = e => {
+    e.stopPropagation();
+    if(!b.disabled) prioritizeNext(+b.dataset.i);
+  });
+  list.scrollTop = Math.min(savedScrollTop, Math.max(0, list.scrollHeight - list.clientHeight));
+  taskListScrollTop = list.scrollTop;
+  renderDetail();
+  persist();
+}
+function setStatus(i, s, err){ files[i].status=s; files[i].error=err||''; }
+
+function prioritizeNext(i){
+  if(i < 0 || i >= files.length) return;
+  const target = files[i];
+  if(target.name === currentName || (jobId && target.status !== 'q')) return;
+  const selectedFile = files[selectedIdx] || null;
+  files.forEach(f => { f.priority = false; });
+  target.priority = true;
+  files.splice(i, 1);
+  let insertAt = 0;
+  if(jobId && currentName){
+    const currentIndex = files.findIndex(f => f.name === currentName);
+    insertAt = currentIndex >= 0 ? currentIndex + 1 : 0;
+  }
+  files.splice(insertAt, 0, target);
+  selectedIdx = selectedFile ? files.indexOf(selectedFile) : insertAt;
+  render();
+  if(jobId) syncPriority();
+  requestAnimationFrame(() => {
+    const row = document.querySelector(`.file[data-fi="${files.indexOf(target)}"]`);
+    if(row) row.scrollIntoView({block:'nearest'});
+  });
+}
+
+function retryFile(i){
+  const f=files[i];
+  if(!f || typeof f.content !== 'string') return;
+  if(jobId){ f.retry_queued=!f.retry_queued; render(); return; }
+  f.retry_queued=false;
+  selectedIdx=i;
+  submitJob([f]);
+}
+
+function selectFile(i){
+  if(i < 0 || i >= files.length) return;
+  const previousIdx = selectedIdx;
+  selectedIdx = i;
+  if(trackingProgress){
+    trackingProgress=false;
+    $('btnTrack').classList.remove('on');
+    $('btnTrack').textContent='跟随翻译进度';
+  }
+  if(previousIdx !== i){
+    const previousRow = document.querySelector(`.file[data-fi="${previousIdx}"]`);
+    const selectedRow = document.querySelector(`.file[data-fi="${i}"]`);
+    if(previousRow) previousRow.classList.remove('selected');
+    if(selectedRow) selectedRow.classList.add('selected');
+  }
+  renderDetail();
+  persist();
+}
+function detailMetaFor(f){
+  const labels={q:'待翻译',run:'翻译中',ok:'已完成',err:'翻译失败'};
+  return `${labels[f.status]||'待翻译'} · ${(((f.content||'').length)/1024).toFixed(1)} KB`;
+}
+function renderDetail(){
+  const detail = $('detail'), f = files[selectedIdx];
+  if(!f){
+    $('detailName').textContent = '原文 / 译文';
+    $('detailMeta').textContent = '选择中间栏中的文件查看内容';
+    detail.innerHTML = '<div class="detail-empty"><div><strong>尚未选择文件</strong><span>从任务列表中选择一项查看对照</span></div></div>';
+    return;
+  }
+  $('detailName').textContent = f.name;
+  $('detailMeta').textContent = detailMetaFor(f);
+  detail.innerHTML = `<div class="compare-wrap" style="--source-w:${compareRatio}%">
+    <div class="split" id="split-${selectedIdx}">${splitHtml(selectedIdx)}</div>
+    <div class="compare-splitter" title="拖动调整原文与译文宽度"></div>
+  </div>`;
+  setupCompareResize();
+}
+function setupCompareResize(){
+  const wrap = document.querySelector('.compare-wrap');
+  const handle = wrap && wrap.querySelector('.compare-splitter');
+  if(!wrap || !handle) return;
+  handle.addEventListener('pointerdown', e => {
+    e.preventDefault(); handle.setPointerCapture(e.pointerId); handle.classList.add('dragging');
+    document.body.classList.add('resizing');
+    const rect = wrap.getBoundingClientRect();
+    const startRatio=compareRatio, startX=e.clientX;
+    let latestX=startX, targetRatio=startRatio, frame=0;
+    const preview=()=>{
+      frame=0;
+      targetRatio=clamp((latestX-rect.left)/rect.width*100,25,75);
+      const delta=(targetRatio-startRatio)/100*rect.width;
+      handle.style.transform=`translate3d(${delta-3}px,0,0)`;
+    };
+    const move = ev => {
+      latestX=ev.clientX;
+      if(!frame) frame=requestAnimationFrame(preview);
+    };
+    const up = () => {
+      if(frame){ cancelAnimationFrame(frame); preview(); }
+      handle.classList.remove('dragging'); document.body.classList.remove('resizing');
+      handle.style.transform='';
+      handle.removeEventListener('pointermove', move); handle.removeEventListener('pointerup', up);
+      handle.removeEventListener('pointercancel', up);
+      compareRatio=targetRatio;
+      wrap.style.setProperty('--source-w', compareRatio + '%');
+      localStorage.setItem('bench_compare_ratio', String(compareRatio));
+    };
+    handle.addEventListener('pointermove', move); handle.addEventListener('pointerup', up);
+    handle.addEventListener('pointercancel', up);
+  });
+}
+function appendOut(i, text, line){
+  if(!files[i]) return;
+  files[i].live_out = files[i].live_out || {};
+  if(line !== undefined && line !== null && Number.isInteger(Number(line))){
+    files[i].live_out[Number(line)] = text;
+    files[i].last_stream_line = Number(line);
+  }else{
+    files[i].legacy_out = (files[i].legacy_out || '') + text + '\n';
+  }
+  const el = $('split-'+i);
+  if(!el) return;
+  const oldTop = el.scrollTop;
+  el.innerHTML = splitHtml(i);
+  if(trackingProgress && files[i].name===currentName) scrollToLatestTranslation(i);
+  else el.scrollTop = oldTop;
+}
+function scrollToLatestTranslation(fi){
+  const el=$('split-'+fi); if(!el) return;
+  const exact=Number.isInteger(files[fi]?.last_stream_line)
+    ? el.querySelector(`.srow[data-line="${files[fi].last_stream_line}"]`) : null;
+  const translated=exact ? [] : [...el.querySelectorAll('.srow')].filter(row => {
+    const cell=row.querySelector('.dcell');
+    return cell && !cell.classList.contains('empty');
+  });
+  const latest=exact || translated[translated.length-1];
+  if(latest) el.scrollTop=Math.max(0, latest.offsetTop-el.clientHeight*.62);
+}
+function focusCurrentProgress(){
+  if(!currentName) return;
+  const fi=fileIdx(currentName);
+  if(fi < 0) return;
+  selectedIdx=fi;
+  render();
+  requestAnimationFrame(() => {
+    scrollToLatestTranslation(fi);
+    const row=document.querySelector(`.file[data-fi="${fi}"]`);
+    if(row) row.scrollIntoView({block:'nearest'});
+  });
+}
+
+function setChip(i, status){
+  if(!files[i]) return;
+  files[i].status = status;   // 同步状态, 避免 render 时读到旧值
+  const row = document.querySelector(`.file[data-fi="${i}"]`);
+  if(!row) return;
+  const chip = row.querySelector('.st');
+  const stMap = {q:['待译','q'], run:['翻译中','run'], ok:['完成','ok'], err:['失败','err']};
+  const [label, cls] = stMap[status] || ['待译','q'];
+  chip.textContent = label; chip.className = 'st ' + cls;
+  if(i===selectedIdx) $('detailMeta').textContent=detailMetaFor(files[i]);
+}
+
+/* ---------- 持久化: 刷新后恢复文件列表与译文 ---------- */
+function persist(){
+  try{
+    const data = files.map(f => ({name:f.name, status:f.status, error:f.error, content_out:f.content_out,
+      content:f.content, live_out:f.live_out||{}, legacy_out:f.legacy_out||'', output_name:f.output_name||null,
+      target_language:f.target_language||null, priority:f.priority||false, retry_queued:!!f.retry_queued}));
+    let s = JSON.stringify(data);
+    if(s.length > 3200000){ data.forEach(d => { delete d.content; delete d.live_out; delete d.legacy_out; }); s = JSON.stringify(data); }
+    localStorage.setItem('bench_files', s);
+  }catch(e){}
+}
+function restoreFiles(){
+  try{
+    const saved = JSON.parse(localStorage.getItem('bench_files'));
+    if(Array.isArray(saved)){
+      files = saved.map(f => ({name:f.name, status:f.status||'q', error:f.error||'',
+        content_out:f.content_out ?? null,
+        content:Object.prototype.hasOwnProperty.call(f,'content') ? f.content : null,
+        live_out:f.live_out||{}, legacy_out:f.legacy_out||f.out||'', output_name:f.output_name||null,
+        target_language:f.target_language||null, priority:!!f.priority, retry_queued:!!f.retry_queued}));
+      if(files.length) render();
+    }
+  }catch(e){}
+}
+async function markOutputsDone(){
+  // 仅在源文哈希和目标语言都一致时恢复，避免同名旧译文被误用。
+  try{
+    const r = await fetch('/api/history');
+    const d = await r.json();
+    const outs = new Map((d.files||[]).map(f => [f.name,f]));
+    const target = readCfg().tgt;
+    let changed = false;
+    for(const f of files){
+      if(f.content_out !== null || typeof f.content !== 'string') continue;
+      const outName = outputName(f.name, target), entry = outs.get(outName);
+      if(!entry || entry.source_name !== f.name || entry.target_language !== target || !entry.source_sha256) continue;
+      const bytes = new TextEncoder().encode(f.content);
+      const hash = [...new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))]
+        .map(b => b.toString(16).padStart(2,'0')).join('');
+      if(hash !== entry.source_sha256) continue;
+      const rr = await fetch('/api/output?name=' + encodeURIComponent(outName));
+      const restored = await rr.json();
+      if(!rr.ok || typeof restored.content !== 'string') continue;
+      f.status = 'ok'; f.content_out = restored.content; f.output_name = outName;
+      f.target_language = target; f.live_out = {}; f.legacy_out = '';
+      changed = true;
+    }
+    if(changed) render();
+  }catch(e){}
+}
+
+/* ---------- 翻译 ---------- */
+function connectSSE(jid){
+  if(es) es.close();
+  es = new EventSource('/api/stream?job=' + jid);
+  es.addEventListener('chunk', e => {
+    const d = JSON.parse(e.data); const fi = fileIdx(d.file);
+    if(fi >= 0) appendOut(fi, d.text||'', d.line);
+  });
+  es.addEventListener('fail', e => {
+    try{
+      const d = JSON.parse(e.data), fi = fileIdx(d.file);
+      if(fi >= 0){ files[fi].error=d.msg||'翻译失败'; setChip(fi,'err'); render(); }
+    }catch(_){}
+  });
+  es.addEventListener('progress', e => {
+    try{
+      const d = JSON.parse(e.data), fi = fileIdx(d.current);
+      currentName = d.current || currentName;
+      $('btnTrack').disabled = !currentName;
+      $('cur').textContent = d.current ? '正在翻译：' + d.current + ' …' : '';
+      updateTotalProgress(d.done, d.total);
+      updateFileProgress(0, 0);
+      if(fi >= 0){ setChip(fi,'run'); if(trackingProgress) focusCurrentProgress(); }
+      document.querySelectorAll('.file.current').forEach(row => row.classList.remove('current'));
+      const currentRow = document.querySelector(`.file[data-fi="${fi}"]`);
+      if(currentRow){
+        currentRow.classList.add('current');
+        const priorityButton = currentRow.querySelector('.pri');
+        if(priorityButton) priorityButton.classList.remove('on');
+      }
+      if(fi >= 0) files[fi].priority = false;
+    }catch(_){}
+  });
+  es.addEventListener('file_progress', e => {
+    try{ const d = JSON.parse(e.data); updateFileProgress(d.done, d.total); }catch(_){}
+  });
+  es.addEventListener('overall_progress', e => {
+    try{ const d = JSON.parse(e.data); updateTotalProgress(d.done, d.total); }catch(_){}
+  });
+  es.addEventListener('file_done', e => {
+    try{
+      const d = JSON.parse(e.data), fi = fileIdx(d.file);
+      if(fi >= 0) setChip(fi,'ok');
+      updateFileProgress(d.done, d.total, true);
+    }catch(_){}
+  });
+  es.addEventListener('done', () => { es.close(); poll(true); });
+  es.addEventListener('interrupted', () => { es.close(); poll(true); });
+  es.onerror = () => {
+    if(es) es.close();
+    if(jobId) setTimeout(() => { if(jobId) connectSSE(jobId); }, 2000);
+  };
+}
+
+function syncPriority(){
+  if(!jobId) return;
+  const names = files.filter(f => f.priority).map(f => f.name);
+  fetch('/api/prioritize', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({job:jobId, names})}).catch(()=>{});
+}
+
+async function submitJob(subFiles){
+  if(submitting || jobId || !subFiles.length) return;
+  submitting = true;
+  $('btnGo').disabled = true; $('btnZip').disabled = true;
+  updateTotalProgress(0, subFiles.length);
+  updateFileProgress(0, 0);
+  interrupted = false; currentName = ''; lastJob = null;
+  subFiles.forEach(f => { f.status='q'; f.error=''; f.live_out={};
+    f.legacy_out=''; f.content_out=null; f.output_name=null; f.target_language=null; f.retry_queued=false; });
+  $('btnStop').disabled = false;
+  render();
+  const cfg = readCfg();
+  const payload = {
+    config:{ server:cfg.server, api_key:cfg.key, model:cfg.model, context_size:+cfg.ctx,
+      temperature:+cfg.temp, top_k:+cfg.topk, top_p:+cfg.topp, repeat_penalty:+cfg.rp,
+      batch_paras:+cfg.bp, chunk_chars:+cfg.cc, context_chars:+cfg.contextChars, src_lang:cfg.src, tgt_lang:cfg.tgt,
+      translation_style:cfg.style,
+      system_prompt:cfg.sys },
+    files: subFiles.map(f => ({name:f.name, content:f.content})),
+    priority: subFiles.filter(f => f.priority).map(f => f.name)
+  };
+  try{
+    const r = await fetch('/api/translate', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
+    const d = await r.json();
+    if(d.error){ submitting=false; alert('启动失败: '+d.error); render(); return; }
+    jobId = d.job; jobNames = subFiles.map(f => f.name);
+    submitting = false;
+    localStorage.setItem('bench_job', jobId);
+    connectSSE(jobId);
+    $('progressBox').style.display='block';
+    pollTimer = setInterval(() => poll(false), 15000);
+    render();
+  }catch(e){ submitting=false; alert('请求失败: '+e); render(); }
+}
+
+$('btnGo').addEventListener('click', () => submitJob(unfinishedFiles()));
+$('btnStop').addEventListener('click', () => {
+  if(!jobId) return;
+  fetch('/api/interrupt', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({job:jobId})}).catch(()=>{});
+  $('btnStop').disabled = true;
+});
+$('btnTrack').addEventListener('click', () => {
+  trackingProgress=!trackingProgress;
+  $('btnTrack').classList.toggle('on', trackingProgress);
+  $('btnTrack').textContent=trackingProgress ? '停止跟随' : '跟随翻译进度';
+  if(trackingProgress) focusCurrentProgress();
+});
+
+function applyPartials(partials){
+  for(const [name, lines] of Object.entries(partials||{})){
+    const fi = fileIdx(name); if(fi < 0) continue;
+    files[fi].live_out = files[fi].live_out || {};
+    for(const [line, text] of Object.entries(lines||{})){
+      if(files[fi].live_out[line] !== text) appendOut(fi, text, Number(line));
+    }
+  }
+}
+
+function applyResults(results){
+  (results||[]).forEach(res => {
+    const fi = fileIdx(res.name); if(fi < 0) return;
+    if(res.status==='ok'){
+      files[fi].content_out = res.content;
+      files[fi].output_name = res.output_name || outputName(res.name, readCfg().tgt);
+      files[fi].target_language = res.target_language || readCfg().tgt;
+      files[fi].live_out = {}; files[fi].legacy_out = '';
+      setChip(fi,'ok');
+    }else{
+      files[fi].error = res.error || '翻译失败';
+      setChip(fi,'err');
+    }
+  });
+}
+
+async function poll(forceFull=false){
+  if(!jobId) return;
+  if(pollBusy){
+    if(forceFull) setTimeout(() => poll(true), 500);
+    return;
+  }
+  pollBusy = true;
+  let d;
+  try{
+    const r = await fetch('/api/status?job=' + jobId + (forceFull ? '&full=1' : ''));
+    d = await r.json();
+  }catch(e){ pollBusy = false; return; }
+  pollBusy = false;
+  if(d.status === 'notfound'){ clearInterval(pollTimer); jobId=null; localStorage.removeItem('bench_job'); render(); return; }
+  updateTotalProgress(d.done, d.total);
+  updateFileProgress(d.current_file_done, d.current_file_total);
+  $('cur').textContent = d.current ? '正在翻译：' + d.current + ' …' : '';
+  currentName = d.current || currentName;
+  $('btnTrack').disabled = !jobId || !currentName;
+  if(d.current && trackingProgress) focusCurrentProgress();
+  applyPartials(d.partials);
+  const doneN = d.done_names || [];
+  (d.names||[]).forEach((name) => {
+    const fi = fileIdx(name); if(fi < 0) return;
+    if(doneN.includes(name)) setChip(fi,'ok');
+    else if(name === d.current && d.status==='running') setChip(fi,'run');
+  });
+  applyResults((d.results||[]).filter(r => r.status === 'error'));
+  if(d.status === 'done' || d.status === 'interrupted'){
+    const queuedRetries = files.filter(f => f.retry_queued && typeof f.content === 'string');
+    clearInterval(pollTimer); lastJob = jobId; jobId = null;
+    interrupted = (d.status === 'interrupted');
+    localStorage.removeItem('bench_job'); localStorage.setItem('bench_lastjob', lastJob);
+    applyResults(d.results);
+    currentName = ''; trackingProgress=false;
+    $('btnStop').disabled = false;
+    $('cur').textContent = interrupted ? '已中断（点「开始翻译」继续剩余文件）' : '全部完成';
+    $('btnGo').disabled = files.length === 0;
+    $('btnZip').disabled = !d.results.some(r => r.status==='ok');
+    setTimeout(()=> $('progressBox').style.display='none', 2000);
+    render();
+    if(!interrupted && queuedRetries.length) setTimeout(() => submitJob(queuedRetries), 0);
+  }
+}
+
+function download(i){
+  const f = files[i];
+  if(f.content_out === null) return;
+  const blob = new Blob([f.content_out], {type:'text/markdown;charset=utf-8'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = f.output_name || outputName(f.name, readCfg().tgt);
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(()=>URL.revokeObjectURL(a.href), 3000);
+}
+
+$('btnTest').addEventListener('click', ping);
+$('btnSave').addEventListener('click', () => {
+  localStorage.setItem('bench_cfg', JSON.stringify(readCfg()));
+  const button=$('btnSave'); button.textContent='已保存'; button.disabled=true;
+  setTimeout(() => { button.textContent='保存配置'; button.disabled=false; }, 1200);
+});
+$('cfg_tgt').addEventListener('change', () => {
+  const target = readCfg().tgt;
+  files.forEach(f => { if(f.content_out !== null && f.target_language !== target) f.status = 'q'; });
+  render();
+  markOutputsDone();
+});
+
+$('btnZip').addEventListener('click', () => {
+  const id = lastJob || jobId || localStorage.getItem('bench_lastjob');
+  if(!id) return;
+  const a = document.createElement('a');
+  a.href = '/api/download?job=' + id;
+  a.download = 'translated.zip';
+  document.body.appendChild(a); a.click(); a.remove();
+});
+
+/* ---------- 刷新后恢复: 恢复文件列表 + 接回运行中的任务 ---------- */
+async function reconnectJob(){
+  let jid = localStorage.getItem('bench_job');
+  if(!jid){
+    try{ const r = await fetch('/api/running'); const d = await r.json(); if(d.job) jid = d.job; }catch(e){}
+  }
+  if(!jid) return;
+  try{
+    const r = await fetch('/api/status?job=' + jid + '&full=1');
+    const d = await r.json();
+    if(!d.status || d.status === 'notfound'){ localStorage.removeItem('bench_job'); return; }
+    if(d.names && files.length === 0){
+      files = d.names.map(n => ({name:n, content:null, status:'q', error:'',
+        content_out:null, live_out:{}, legacy_out:'', output_name:null, target_language:null, priority:false, retry_queued:false}));
+    }
+    currentName = d.current || '';
+    $('cur').textContent = d.current ? '正在翻译：' + d.current + ' …' : '';
+    updateTotalProgress(d.done, d.total);
+    updateFileProgress(d.current_file_done, d.current_file_total);
+    applyPartials(d.partials); applyResults(d.results);
+    if(d.status === 'done' || d.status === 'interrupted'){
+      interrupted = d.status === 'interrupted'; lastJob = jid; jobId = null;
+      localStorage.removeItem('bench_job'); localStorage.setItem('bench_lastjob', jid);
+      render(); return;
+    }
+    jobId = jid; jobNames = d.names || [];
+    connectSSE(jobId);
+    $('progressBox').style.display='block';
+    pollTimer = setInterval(() => poll(false), 15000);
+    render();
+  }catch(e){}
+}
+async function init(){
+  restoreFiles();
+  lastJob = localStorage.getItem('bench_lastjob');
+  await reconnectJob();
+  await markOutputsDone();
+  render();
+}
+init();
+</script>
+</body>
+</html>

@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Translation inputs, outputs and runtime data
+outputs/
+output/
+inputs/
+translations/
+translated/
+*.log
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.local.*
+start.bat
+
+# Local notes and handoff documents
+交接文档.md
+
+# Models and large generated files
+*.gguf
+*.safetensors
+*.bin
+*.zip
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
