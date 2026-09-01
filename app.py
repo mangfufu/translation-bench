@@ -777,6 +777,37 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._serve_file(os.path.join(STATIC_DIR, path.lstrip("/")))
 
+    def do_DELETE(self):
+        path, query = self._request_parts()
+        if path != "/api/output":
+            self._send_json({"error": "not found"}, 404)
+            return
+
+        name = query.get("name", [""])[0]
+        if not name or name != os.path.basename(name) or name.endswith(".meta.json"):
+            self._send_json({"error": "invalid output name"}, 400)
+            return
+
+        output_path = os.path.join(OUTPUTS_DIR, name)
+        deleted = []
+        try:
+            for candidate in (output_path, output_path + ".meta.json"):
+                if os.path.isfile(candidate):
+                    os.remove(candidate)
+                    deleted.append(os.path.basename(candidate))
+        except OSError as exc:
+            self._send_json({"error": f"删除输出失败: {exc}"}, 500)
+            return
+
+        # 同步移除内存中的同名结果，避免已删除的译文仍能从旧任务 ZIP 中导出。
+        with JOBS_LOCK:
+            for job in JOBS.values():
+                job["results"] = [
+                    result for result in job.get("results", [])
+                    if result.get("output_name") != name
+                ]
+        self._send_json({"ok": True, "name": name, "deleted": deleted})
+
     def _serve_file(self, path):
         static_root = os.path.realpath(STATIC_DIR)
         resolved = os.path.realpath(path)

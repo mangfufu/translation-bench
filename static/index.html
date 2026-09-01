@@ -92,6 +92,11 @@
   .file .retry{width:26px;height:26px;padding:5px;display:inline-flex;align-items:center;justify-content:center;color:var(--err);background:transparent;border-color:transparent}
   .file .retry:hover:not(:disabled){border-color:#fff;background:#fff;color:#000}.file .retry svg{width:14px;height:14px}
   .file .retry.queued{color:#fff;border-color:#fff;background:#222}
+  .file-actions{display:flex;align-items:center;justify-content:flex-end;gap:2px}
+  .file .delete{width:26px;height:26px;padding:5px;display:inline-flex;align-items:center;justify-content:center;color:var(--ink-faint);background:transparent;border-color:transparent}
+  .file .delete:hover:not(:disabled){border-color:#fff;background:#fff;color:#000}.file .delete svg{width:14px;height:14px}
+  .file.selected .delete,.file.selected .retry,.file.selected .dl{color:#000}
+  .file.selected .delete:hover:not(:disabled),.file.selected .retry:hover:not(:disabled){border-color:#000;background:#000;color:#fff}
   .queue-foot{flex:none;padding:8px 12px;border-top:1px solid var(--line-2);color:var(--ink-faint);font:10px var(--mono);background:#050505}
 
   .detail-panel{display:flex;flex-direction:column;background:var(--paper)}
@@ -544,6 +549,8 @@ function render(){
     const retryTitle = retryDisabled ? '原文未保留，请重新添加文件'
       : (jobId ? (f.retry_queued ? '已加入批次结束后的重试队列，点击取消' : '当前批次结束后自动重试') : '重试该文件');
     const retry = f.status==='err' ? `<button class="retry${f.retry_queued?' queued':''}" data-i="${i}" title="${retryTitle}" aria-label="重试该文件" ${retryDisabled?'disabled':''}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6v5h-5"/><path d="M18.2 15a7 7 0 1 1-.7-7.8L20 11"/></svg></button>` : '';
+    const remove = `<button class="delete" data-i="${i}" title="从任务列表删除" aria-label="删除任务" ${jobId||submitting?'disabled':''}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 10v6M14 10v6"/></svg></button>`;
+    const actions = `<span class="file-actions">${dl}${retry}${remove}</span>`;
     const err = f.error ? `<span class="err">${esc(f.error)}</span>` : '';
     const canPrioritize = runnableSet.has(f) && f.name !== currentName && (!jobId || f.status === 'q');
     const priorityTitle = jobId ? '安排为当前任务的下一个任务' : '移动到队列最前';
@@ -553,13 +560,16 @@ function render(){
       <button class="pri${f.priority?' on':''}" data-i="${i}" title="${priorityTitle}" aria-label="${priorityTitle}" ${canPrioritize?'':'disabled'}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m17 11-5-5-5 5M17 18l-5-5-5 5"/></svg></button>
       <span class="st ${cls}">${label}</span>
       <span class="nm" title="${escAttr(f.name)}">${esc(f.name)}</span>
-      ${dl}${retry}${err}
+      ${actions}${err}
     </div>`;
   }).join('');
   list.querySelectorAll('.file').forEach(row => row.onclick = () => selectFile(+row.dataset.fi));
   list.querySelectorAll('.dl').forEach(b => b.onclick = e => { e.stopPropagation(); download(b.dataset.i); });
   list.querySelectorAll('.retry').forEach(b => b.onclick = e => {
     e.stopPropagation(); if(!b.disabled) retryFile(+b.dataset.i);
+  });
+  list.querySelectorAll('.delete').forEach(b => b.onclick = e => {
+    e.stopPropagation(); if(!b.disabled) deleteFile(+b.dataset.i);
   });
   list.querySelectorAll('.pri').forEach(b => b.onclick = e => {
     e.stopPropagation();
@@ -602,6 +612,39 @@ function retryFile(i){
   f.retry_queued=false;
   selectedIdx=i;
   submitJob([f]);
+}
+
+async function deleteFile(i){
+  if(jobId || submitting || i < 0 || i >= files.length) return;
+  const f = files[i];
+  if(!confirm(`确认从任务列表移除“${f.name}”？`)) return;
+
+  const diskName = f.output_name || (f.content_out !== null
+    ? outputName(f.name, f.target_language || $('cfg_tgt').value)
+    : '');
+  if(diskName && confirm(
+    `是否同时删除磁盘中的译文“${diskName}”？\n\n确定：删除任务和磁盘译文\n取消：仅从任务列表移除`
+  )){
+    try{
+      const response = await fetch('/api/output?name=' + encodeURIComponent(diskName), {method:'DELETE'});
+      const result = await response.json();
+      if(!response.ok || !result.ok){
+        alert('磁盘译文删除失败：' + (result.error || response.status));
+        return;
+      }
+    }catch(error){
+      alert('磁盘译文删除失败：' + error.message);
+      return;
+    }
+  }
+  const selectedFile = files[selectedIdx] || null;
+  files.splice(i, 1);
+  if(selectedFile === f){
+    selectedIdx = files.length ? Math.min(i, files.length - 1) : -1;
+  }else{
+    selectedIdx = selectedFile ? files.indexOf(selectedFile) : -1;
+  }
+  render();
 }
 
 function selectFile(i){
