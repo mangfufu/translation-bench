@@ -11,6 +11,7 @@ from http.server import ThreadingHTTPServer
 from xml.sax.saxutils import escape
 
 import app
+import document_formats
 from document_formats import (
     DocumentFormatError,
     build_binary_output,
@@ -47,6 +48,29 @@ def make_docx():
         archive.writestr("_rels/.rels", relationships)
         archive.writestr("word/document.xml", document)
         archive.writestr("word/media/image1.png", b"fake-image-data")
+    return output.getvalue()
+
+
+def make_nested_paragraph_docx():
+    """生成包含文本框式嵌套段落的最小 DOCX。"""
+    source = make_docx()
+    old_paragraph = (
+        b'<w:p><w:r><w:t xml:space="preserve">Hello </w:t></w:r>'
+        b'<w:r><w:rPr><w:b/></w:rPr><w:t>world</w:t></w:r></w:p>'
+    )
+    nested_paragraph = (
+        b'<w:p><w:r><w:t>Outer text.</w:t></w:r><w:txbxContent>'
+        b'<w:p><w:r><w:t>Inner text.</w:t></w:r></w:p>'
+        b'</w:txbxContent></w:p>'
+    )
+    output = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(source), "r") as archive:
+        with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as target:
+            for info in archive.infolist():
+                payload = archive.read(info.filename)
+                if info.filename == "word/document.xml":
+                    payload = payload.replace(old_paragraph, nested_paragraph, 1)
+                target.writestr(info, payload)
     return output.getvalue()
 
 
@@ -314,7 +338,7 @@ def make_rich_docx():
     return output.getvalue()
 
 
-def make_epub(encrypted=False, line_break=False):
+def make_epub(encrypted=False, line_break=False, mixed_blocks=False):
     container = b'''<?xml version="1.0"?>
 <container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0">
   <rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>
@@ -340,6 +364,13 @@ def make_epub(encrypted=False, line_break=False):
             b"<br/>Still here.</p><p><img",
             1,
         )
+    if mixed_blocks:
+        chapter = b'''<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Metadata title</title></head><body>
+<div>Intro <em>direct</em> text.<p>Nested paragraph.</p>Trailing <strong>direct text.</strong></div>
+<ul><li>List prefix.<p>Nested list paragraph.</p>List suffix.</li></ul>
+</body></html>'''
     second = b'''<?xml version="1.0" encoding="UTF-8"?>
 <html xmlns="http://www.w3.org/1999/xhtml"><head><title>Second</title></head><body><p>Morning arrived.</p></body></html>'''
     output = io.BytesIO()
@@ -357,6 +388,144 @@ def make_epub(encrypted=False, line_break=False):
 </encryption>'''.encode("utf-8")
             archive.writestr("META-INF/encryption.xml", encryption)
     return output.getvalue()
+
+
+def make_pdf(text_layer=True, encrypted=False):
+    """生成三页、带真实文字层的 PDF 手动试译样本。"""
+    from reportlab.lib.colors import HexColor
+    from reportlab.lib.pagesizes import letter
+    from reportlab.pdfgen.canvas import Canvas
+
+    output = io.BytesIO()
+    pdf = Canvas(output, pagesize=letter, invariant=1, pageCompression=1)
+    pdf.setCreator("Translation Bench Test Suite")
+    pdf.setTitle("PDF Text Layer Translation Fixture")
+
+    if not text_layer:
+        pdf.setStrokeColor(HexColor("#243447"))
+        pdf.setFillColor(HexColor("#E7EDF3"))
+        pdf.rect(72, 220, 468, 350, fill=1, stroke=1)
+        pdf.circle(306, 395, 96, fill=0, stroke=1)
+        pdf.showPage()
+        pdf.save()
+    else:
+        def line(text, y, size=11, x=72, bold=False):
+            pdf.setFont("Helvetica-Bold" if bold else "Helvetica", size)
+            pdf.setFillColor(HexColor("#111111"))
+            pdf.drawString(x, y, text)
+
+        line("The Glass Meridian", 720, 22, bold=True)
+        line("PDF TEXT-LAYER TRANSLATION FIXTURE", 690, 9, bold=True)
+        line("Northlight Station stood on a shelf of black volcanic rock where the", 650)
+        line("western sea narrowed into a channel. From the mainland, its tower", 635)
+        line("looked like a pale needle pushed through the horizon.", 620)
+        line("Ships used its lamp, weather offices used its instruments, and the", 585)
+        line("people of Greyhaven used it whenever conversation failed.", 570)
+        line('"Did they send you the calibration weights?" Mara asked.', 530)
+        line('"They were here yesterday," Elias replied.', 510)
+        line('"Were?" she prompted.', 490)
+        line("A brass rail spiraled upward around the central machinery well. Far", 450)
+        line("below, something struck at a steady interval: not quite a bell, not", 435)
+        line("quite a hammer, but a patient metallic heartbeat.", 420)
+        line("The page also contains 15.75%, v2.4.1, {{station_id}}, and", 380)
+        line("https://example.com/manual?id=42&mode=safe for preservation tests.", 365)
+        pdf.showPage()
+
+        line("Inspection Notes", 720, 18, bold=True)
+        line("- Confirm that every extracted item remains a separate translation unit.", 680)
+        line("- Keep URLs, numbers, version strings, and placeholders unchanged.", 655)
+        line("- Preserve page order even when translated text grows longer.", 630)
+        line("The source includes a compact table-like region below. PDF files do", 585)
+        line("not carry reliable table semantics, so the output intentionally reflows", 570)
+        line("the extracted text instead of pretending to preserve cell geometry.", 555)
+        pdf.setStrokeColor(HexColor("#5B6773"))
+        for x in (72, 210, 360, 540):
+            pdf.line(x, 365, x, 505)
+        for y in (365, 400, 435, 470, 505):
+            pdf.line(72, y, 540, y)
+        line("Term", 484, 9, 82, True)
+        line("Meaning", 484, 9, 220, True)
+        line("Required handling", 484, 9, 370, True)
+        line("Bell", 449, 9, 82)
+        line("mechanical signal", 449, 9, 220)
+        line("translate consistently", 449, 9, 370)
+        line("Keeper", 414, 9, 82)
+        line("station operator", 414, 9, 220)
+        line("retain role context", 414, 9, 370)
+        line("Drift", 379, 9, 82)
+        line("timing deviation", 379, 9, 220)
+        line("do not summarize", 379, 9, 370)
+        line("A vector diagram is present only to verify that non-text artwork does", 325)
+        line("not prevent text-layer extraction.", 310)
+        pdf.setStrokeColor(HexColor("#243447"))
+        pdf.circle(175, 210, 46, fill=0, stroke=1)
+        pdf.line(221, 210, 410, 210)
+        pdf.line(380, 230, 410, 210)
+        pdf.line(380, 190, 410, 210)
+        pdf.showPage()
+
+        line("Long-form Continuity Sample", 720, 18, bold=True)
+        paragraphs = [
+            (
+                "At dawn on the third day, Mara returned to the lower gallery with a "
+                "new notebook and no expectation of finding an easy answer. The delayed "
+                "ninth beat had become stronger overnight, yet every gauge insisted that "
+                "the assembly was operating within its legal tolerance."
+            ),
+            (
+                "Elias placed the missing calibration case on the workbench without "
+                "explaining where it had been found. Its brass corners were wet with salt "
+                "water, while the paper inventory inside remained perfectly dry. Mara "
+                "recorded both facts before asking the question he clearly hoped to avoid."
+            ),
+            (
+                '"If the room was locked, who carried this outside?" she asked. Elias '
+                'looked toward the shaft and answered, "That depends on whether you believe '
+                'the station keeps time, or whether time keeps the station."'
+            ),
+            (
+                "The sentence sounded theatrical, but the machinery below them answered "
+                "with three quick impacts and a long silence. For the first time since her "
+                "arrival, the eastern clock advanced by exactly one minute."
+            ),
+            (
+                "This final paragraph is deliberately long enough to wrap across several "
+                "visual lines. The importer should reconstruct it as a coherent unit, the "
+                "translator should receive neighboring context according to the selected "
+                "mode, and the generated PDF should add pages instead of clipping text at "
+                "the bottom margin."
+            ),
+        ]
+        y = 680
+        for paragraph in paragraphs:
+            words = paragraph.split()
+            current = ""
+            for word in words:
+                candidate = (current + " " + word).strip()
+                if pdf.stringWidth(candidate, "Helvetica", 11) > 468 and current:
+                    line(current, y)
+                    y -= 15
+                    current = word
+                else:
+                    current = candidate
+            if current:
+                line(current, y)
+                y -= 15
+            y -= 18
+        pdf.save()
+
+    raw = output.getvalue()
+    if not encrypted:
+        return raw
+    from pypdf import PdfReader, PdfWriter
+    reader = PdfReader(io.BytesIO(raw))
+    writer = PdfWriter()
+    for page in reader.pages:
+        writer.add_page(page)
+    writer.encrypt("translation-bench-test")
+    protected = io.BytesIO()
+    writer.write(protected)
+    return protected.getvalue()
 
 
 class DocumentFormatTests(unittest.TestCase):
@@ -407,6 +576,23 @@ class DocumentFormatTests(unittest.TestCase):
             self.assertIn(b"<w:hyperlink", document)
             self.assertIn(b"<w:pageBreakBefore", document)
 
+    def test_docx_nested_textbox_paragraph_is_not_duplicated(self):
+        source = make_nested_paragraph_docx()
+
+        self.assertEqual(
+            extract_binary_text("docx", source),
+            "Outer text.\nInner text.\nTable cell",
+        )
+        translated = build_binary_output(
+            "docx",
+            source,
+            "外层文字。\n内层文字。\n表格内容",
+        )
+        self.assertEqual(
+            extract_binary_text("docx", translated),
+            "外层文字。\n内层文字。\n表格内容",
+        )
+
     def test_epub_round_trip_follows_spine_and_preserves_assets(self):
         source = make_epub()
         expected = "第一章\n房间里很安静。\n一盏灯仍然亮着。\n清晨来临。"
@@ -443,6 +629,280 @@ class DocumentFormatTests(unittest.TestCase):
         with zipfile.ZipFile(io.BytesIO(translated)) as archive:
             chapter = archive.read("OEBPS/chapter.xhtml").decode("utf-8")
             self.assertIn("<br", chapter)
+
+    def test_epub_mixed_parent_and_nested_block_text_round_trips(self):
+        source = make_epub(mixed_blocks=True)
+        extracted = extract_binary_text("epub", source)
+        expected_source = (
+            "Intro direct text.\nNested paragraph.\nTrailing direct text.\n"
+            "List prefix.\nNested list paragraph.\nList suffix.\nMorning arrived."
+        )
+        translated_text = (
+            "开头直接文字。\n嵌套段落。\n结尾直接文字。\n"
+            "列表前缀。\n嵌套列表段落。\n列表后缀。\n清晨来临。"
+        )
+
+        self.assertEqual(extracted, expected_source)
+        translated = build_binary_output("epub", source, translated_text)
+        self.assertEqual(extract_binary_text("epub", translated), translated_text)
+        with zipfile.ZipFile(io.BytesIO(translated)) as archive:
+            chapter = archive.read("OEBPS/chapter.xhtml").decode("utf-8")
+            self.assertIn("<em", chapter)
+            self.assertIn("<strong", chapter)
+
+    def test_pdf_text_layer_extracts_and_builds_reflowed_translation(self):
+        from pypdf import PdfReader
+
+        source = make_pdf()
+        extracted = extract_binary_text("pdf", source)
+        source_units = extracted.split("\n")
+        translated_text = "\n".join(
+            f"Stable translated unit {index:03d}."
+            for index in range(1, len(source_units) + 1)
+        )
+
+        self.assertGreaterEqual(len(source_units), 20)
+        self.assertIn("The Glass Meridian", extracted)
+        self.assertIn('"Were?" she prompted.', extracted)
+        self.assertIn("https://example.com/manual?id=42&mode=safe", extracted)
+        self.assertIn("Long-form Continuity Sample", extracted)
+
+        translated = build_binary_output(
+            "pdf",
+            source,
+            translated_text,
+            document_title="sample.en.pdf",
+            target_language="英文",
+        )
+        reader = PdfReader(io.BytesIO(translated))
+        self.assertGreaterEqual(len(reader.pages), 3)
+        self.assertEqual(reader.metadata.title, "sample.en.pdf")
+        self.assertEqual(extract_binary_text("pdf", translated), translated_text)
+
+    def test_pdf_cjk_output_embeds_a_covering_system_font(self):
+        source = make_pdf()
+        source_units = extract_binary_text("pdf", source).split("\n")
+        translations = "\n".join("稳定译文。" for _ in source_units)
+
+        try:
+            output = build_binary_output(
+                "pdf",
+                source,
+                translations,
+                target_language="中文",
+            )
+        except DocumentFormatError as exc:
+            if "CJK 字体" in str(exc) or "Noto Sans CJK" in str(exc):
+                self.skipTest("当前测试系统未安装覆盖中文的 CJK 字体")
+            raise
+        self.assertTrue(b"/FontFile2" in output or b"/FontFile3" in output)
+        self.assertEqual(extract_binary_text("pdf", output), translations)
+
+    def test_pdf_refuses_unverifiable_cid_font_fallback(self):
+        source = make_pdf()
+        source_units = extract_binary_text("pdf", source).split("\n")
+        old_candidates = document_formats._pdf_cjk_font_path_candidates
+        try:
+            document_formats._pdf_cjk_font_path_candidates = lambda _script: []
+            with self.assertRaisesRegex(DocumentFormatError, "CJK 字体|Noto"):
+                build_binary_output(
+                    "pdf",
+                    source,
+                    "\n".join("稳定译文❤️😀" for _ in source_units),
+                    target_language="中文",
+                )
+        finally:
+            document_formats._pdf_cjk_font_path_candidates = old_candidates
+
+    def test_pdf_line_direction_uses_first_strong_character(self):
+        direction = document_formats._pdf_line_direction
+
+        self.assertEqual(direction("Version 2 مثال", "阿拉伯文"), "LTR")
+        self.assertEqual(direction("https://example.com مثال", "阿拉伯文"), "LTR")
+        self.assertEqual(direction("مثال https://example.com", "英文"), "RTL")
+        self.assertEqual(direction("2026/09/02", "英文"), "LTR")
+        self.assertEqual(direction("2026/09/02", "阿拉伯文"), "RTL")
+
+    def test_pdf_shaping_detects_thai_tibetan_and_mongolian(self):
+        shaping = document_formats._pdf_contains_shaping_script
+
+        self.assertTrue(shaping("ภาษาไทย"))
+        self.assertTrue(shaping("བོད་ཡིག"))
+        self.assertTrue(shaping("ᠮᠣᠩᠭᠣᠯ"))
+        self.assertFalse(shaping("Plain English 2026"))
+
+    def test_pdf_without_text_layer_and_encrypted_pdf_are_rejected(self):
+        with self.assertRaisesRegex(DocumentFormatError, "文字层|OCR"):
+            extract_binary_text("pdf", make_pdf(text_layer=False))
+        with self.assertRaisesRegex(DocumentFormatError, "加密"):
+            extract_binary_text("pdf", make_pdf(encrypted=True))
+
+    def test_pdf_content_stream_limits_run_before_text_extraction(self):
+        from pypdf import PdfReader
+
+        source = make_pdf()
+        reader = PdfReader(io.BytesIO(source))
+        first_size = len(reader.pages[0].get_contents().get_data())
+        old_page_limit = document_formats.MAX_PDF_PAGE_CONTENT_BYTES
+        old_total_limit = document_formats.MAX_PDF_TOTAL_CONTENT_BYTES
+        try:
+            document_formats.MAX_PDF_PAGE_CONTENT_BYTES = first_size - 1
+            with self.assertRaisesRegex(DocumentFormatError, "单页解压内容流"):
+                extract_binary_text("pdf", source)
+
+            document_formats.MAX_PDF_PAGE_CONTENT_BYTES = old_page_limit
+            document_formats.MAX_PDF_TOTAL_CONTENT_BYTES = 1
+            with self.assertRaisesRegex(DocumentFormatError, "合计"):
+                extract_binary_text("pdf", source)
+        finally:
+            document_formats.MAX_PDF_PAGE_CONTENT_BYTES = old_page_limit
+            document_formats.MAX_PDF_TOTAL_CONTENT_BYTES = old_total_limit
+
+    def test_pdf_parser_limits_are_temporarily_tightened_and_restored(self):
+        import pypdf.filters as pdf_filters
+
+        names = (
+            "FLATE_MAX_BUFFER_SIZE",
+            "JBIG2_MAX_OUTPUT_LENGTH",
+            "LZW_MAX_OUTPUT_LENGTH",
+            "MAX_DECLARED_STREAM_LENGTH",
+            "RUN_LENGTH_MAX_OUTPUT_LENGTH",
+            "ZLIB_MAX_OUTPUT_LENGTH",
+        )
+        previous = {name: getattr(pdf_filters, name) for name in names}
+        with document_formats._pdf_decode_limits():
+            for name in names:
+                self.assertLessEqual(
+                    getattr(pdf_filters, name),
+                    document_formats.MAX_PDF_PAGE_CONTENT_BYTES + 1,
+                )
+        self.assertEqual(
+            {name: getattr(pdf_filters, name) for name in names},
+            previous,
+        )
+
+    def test_pdf_long_unit_continues_on_new_pages_without_clipping(self):
+        from pypdf import PdfReader
+
+        source = make_pdf()
+        source_units = extract_binary_text("pdf", source).split("\n")
+        translations = [
+            f"Normal translation {index}." for index in range(len(source_units))
+        ]
+        translations[0] = (
+            "A very long translated unit must continue across pages. " * 700
+            + "END MARKER."
+        )
+
+        output = build_binary_output(
+            "pdf",
+            source,
+            "\n".join(translations),
+            target_language="英文",
+        )
+        reader = PdfReader(io.BytesIO(output))
+        visible = "".join(page.extract_text() or "" for page in reader.pages)
+
+        self.assertGreater(len(reader.pages), 3)
+        self.assertIn("END MARKER.", visible)
+        self.assertIn("Normal translation 32.", visible)
+
+    def test_pdf_output_preview_uses_stable_state_units(self):
+        source = make_pdf()
+        original_paths = (
+            app.OUTPUTS_DIR,
+            app.OUTPUT_INDEX_PATH,
+            app.SOURCE_CACHE_DIR,
+        )
+        with tempfile.TemporaryDirectory() as root:
+            try:
+                app.OUTPUTS_DIR = os.path.join(root, "outputs")
+                app.OUTPUT_INDEX_PATH = os.path.join(root, "state.json")
+                app.SOURCE_CACHE_DIR = os.path.join(root, "sources")
+                imported = cache_binary_source(
+                    app.SOURCE_CACHE_DIR, "sample.pdf", source
+                )
+                translations = "\n".join(
+                    f"PDF translation {index}."
+                    for index, _ in enumerate(imported["content"].split("\n"), 1)
+                )
+                output_name = app.save_translation_output(
+                    {"name": "sample.pdf", **imported}, translations, "英文"
+                )
+                metadata = app._read_output_index()[output_name]
+                output_path = os.path.join(app.OUTPUTS_DIR, output_name)
+
+                self.assertEqual(output_name, "sample.en.pdf")
+                self.assertEqual(metadata["preview_content"], translations)
+                self.assertEqual(
+                    app.read_output_preview(
+                        output_path, output_name, metadata["preview_content"]
+                    ),
+                    translations,
+                )
+            finally:
+                app.OUTPUTS_DIR, app.OUTPUT_INDEX_PATH, app.SOURCE_CACHE_DIR = original_paths
+
+    def test_pdf_import_preview_and_download_api(self):
+        source = make_pdf()
+        original_paths = (
+            app.OUTPUTS_DIR,
+            app.OUTPUT_INDEX_PATH,
+            app.SOURCE_CACHE_DIR,
+        )
+        with tempfile.TemporaryDirectory() as root:
+            server = None
+            thread = None
+            try:
+                app.OUTPUTS_DIR = os.path.join(root, "outputs")
+                app.OUTPUT_INDEX_PATH = os.path.join(root, "state.json")
+                app.SOURCE_CACHE_DIR = os.path.join(root, "sources")
+                server = ThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                connection = http.client.HTTPConnection(
+                    "127.0.0.1", server.server_address[1], timeout=5
+                )
+                payload = json.dumps({
+                    "name": "sample.pdf",
+                    "data_base64": base64.b64encode(source).decode("ascii"),
+                }).encode("utf-8")
+                connection.request(
+                    "POST", "/api/import", body=payload,
+                    headers={"Content-Type": "application/json"},
+                )
+                response = connection.getresponse()
+                imported = json.loads(response.read().decode("utf-8"))
+                self.assertEqual(response.status, 200)
+                self.assertEqual(imported["source_format"], "pdf")
+
+                translations = "\n".join(
+                    f"API translation {index}."
+                    for index, _ in enumerate(imported["content"].split("\n"), 1)
+                )
+                output_name = app.save_translation_output(
+                    {"name": "sample.pdf", **imported}, translations, "英文"
+                )
+                connection.request("GET", "/api/output?name=" + output_name)
+                response = connection.getresponse()
+                preview = json.loads(response.read().decode("utf-8"))
+                self.assertEqual(response.status, 200)
+                self.assertEqual(preview["content"], translations)
+
+                connection.request("GET", "/api/output-file?name=" + output_name)
+                response = connection.getresponse()
+                downloaded = response.read()
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.getheader("Content-Type"), "application/pdf")
+                self.assertTrue(downloaded.startswith(b"%PDF-"))
+                connection.close()
+            finally:
+                if server is not None:
+                    server.shutdown()
+                    server.server_close()
+                if thread is not None:
+                    thread.join(timeout=5)
+                app.OUTPUTS_DIR, app.OUTPUT_INDEX_PATH, app.SOURCE_CACHE_DIR = original_paths
 
     def test_damaged_non_text_zip_member_is_rejected_before_cache(self):
         source = make_epub()
@@ -628,6 +1088,69 @@ class DocumentFormatTests(unittest.TestCase):
         finally:
             with app.JOBS_LOCK:
                 app.JOBS.pop("already-running", None)
+            connection.close()
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_local_http_guard_rejects_rebinding_cross_site_and_simple_post(self):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        port = server.server_address[1]
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        try:
+            connection.request(
+                "GET", "/api/history", headers={"Host": "malicious.example"}
+            )
+            response = connection.getresponse()
+            response.read()
+            self.assertEqual(response.status, 403)
+
+            connection.request(
+                "GET", "/api/history", headers={"Sec-Fetch-Site": "cross-site"}
+            )
+            response = connection.getresponse()
+            response.read()
+            self.assertEqual(response.status, 403)
+
+            connection.request(
+                "POST",
+                "/api/interrupt",
+                body="job=missing",
+                headers={"Content-Type": "text/plain"},
+            )
+            response = connection.getresponse()
+            response.read()
+            self.assertEqual(response.status, 415)
+
+            connection.request(
+                "POST",
+                "/api/interrupt",
+                body=b'{}',
+                headers={
+                    "Content-Type": "application/json",
+                    "Origin": "https://malicious.example",
+                },
+            )
+            response = connection.getresponse()
+            response.read()
+            self.assertEqual(response.status, 403)
+
+            connection.request(
+                "POST",
+                "/api/interrupt",
+                body=b'{}',
+                headers={
+                    "Content-Type": "application/json; charset=utf-8",
+                    "Origin": f"http://127.0.0.1:{port}",
+                },
+            )
+            response = connection.getresponse()
+            payload = json.loads(response.read().decode("utf-8"))
+            self.assertEqual(response.status, 200)
+            self.assertFalse(payload["ok"])
+        finally:
             connection.close()
             server.shutdown()
             server.server_close()

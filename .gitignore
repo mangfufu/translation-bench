@@ -10,6 +10,7 @@ translations/
 translated/
 .translation-state.json*
 .translation-sources/
+tmp/
 *.log
 
 # Local configuration and secrets

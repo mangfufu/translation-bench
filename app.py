@@ -229,7 +229,11 @@ def save_translation_output(file_info, translated_content, target_language):
             file_info.get("source_sha256", ""),
         )
         output_data = build_binary_output(
-            source_format, source_data, translated_content
+            source_format,
+            source_data,
+            translated_content,
+            document_title=output_name,
+            target_language=target_language,
         )
         digest = binary_digest(source_data)
     else:
@@ -258,12 +262,18 @@ def save_translation_output(file_info, translated_content, target_language):
         "target_language": target_language,
         "output_name": output_name,
     }
+    if source_format == "pdf":
+        # 重排后的 PDF 视觉换行不等于翻译单元边界。把无格式预览集中
+        # 放在状态文件中，恢复页面时仍可与原文稳定一一对应。
+        metadata["preview_content"] = translated_content
     save_output_metadata(metadata)
     return output_name
 
 
-def read_output_preview(output_path, output_name):
+def read_output_preview(output_path, output_name, preview_content=None):
     extension = document_extension(output_name)
+    if extension == ".pdf" and isinstance(preview_content, str):
+        return normalize_text_content(preview_content)[0]
     if extension in BINARY_EXTENSIONS:
         with open(output_path, "rb") as handle:
             return extract_binary_text(extension, handle.read())
@@ -1607,11 +1617,64 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+    def _request_allowed(self, mutating=False):
+        """只接受本机同源浏览器请求，阻断 DNS rebinding 与简单 CSRF。"""
+        def reject(message, code=403):
+            self.close_connection = True
+            self._send_json({"error": message}, code)
+            return False
+
+        host_values = self.headers.get_all("Host", [])
+        if len(host_values) != 1:
+            return reject("invalid host")
+        try:
+            host_parts = urlsplit("//" + host_values[0])
+            host_name = (host_parts.hostname or "").lower()
+            host_port = host_parts.port
+        except ValueError:
+            return reject("invalid host")
+        server_port = int(self.server.server_address[1])
+        if (
+            host_name not in {"localhost", "127.0.0.1", "::1"}
+            or host_port not in {None, server_port}
+        ):
+            return reject("local access only")
+
+        if self.headers.get("Sec-Fetch-Site", "").lower() == "cross-site":
+            return reject("cross-site request rejected")
+
+        origin_values = self.headers.get_all("Origin", [])
+        if len(origin_values) > 1:
+            return reject("invalid origin")
+        if origin_values:
+            try:
+                origin = urlsplit(origin_values[0])
+                origin_name = (origin.hostname or "").lower()
+                origin_port = origin.port or (
+                    443 if origin.scheme.lower() == "https" else 80
+                )
+            except ValueError:
+                return reject("invalid origin")
+            if (
+                origin.scheme.lower() != "http"
+                or origin_name != host_name
+                or origin_port != server_port
+            ):
+                return reject("cross-origin request rejected")
+
+        if mutating and self.command == "POST":
+            content_type = self.headers.get("Content-Type", "")
+            if content_type.split(";", 1)[0].strip().lower() != "application/json":
+                return reject("application/json required", 415)
+        return True
+
     def _send_json(self, obj, code=200):
         data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
+        if self.close_connection:
+            self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(data)
 
@@ -1628,6 +1691,8 @@ class Handler(BaseHTTPRequestHandler):
         return unquote(parsed.path), parse_qs(parsed.query)
 
     def do_GET(self):
+        if not self._request_allowed():
+            return
         path, query = self._request_parts()
         if path == "/" or path == "/index.html":
             self._serve_file(os.path.join(STATIC_DIR, "index.html"))
@@ -1668,7 +1733,7 @@ class Handler(BaseHTTPRequestHandler):
                 output_index = _read_output_index()
             if os.path.isdir(OUTPUTS_DIR):
                 for fn in sorted(os.listdir(OUTPUTS_DIR)):
-                    if fn.lower().endswith((".md", ".markdown", ".txt", ".text", ".srt", ".vtt", ".docx", ".epub")):
+                    if fn.lower().endswith((".md", ".markdown", ".txt", ".text", ".srt", ".vtt", ".docx", ".epub", ".pdf")):
                         p = os.path.join(OUTPUTS_DIR, fn)
                         entry = {"name": fn, "size": os.path.getsize(p)}
                         meta = output_index.get(fn, {})
@@ -1690,7 +1755,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"error": "not found"}, 404)
                 return
             try:
-                content = read_output_preview(output_path, name)
+                with OUTPUT_INDEX_LOCK:
+                    metadata = _read_output_index().get(name, {})
+                content = read_output_preview(
+                    output_path, name, metadata.get("preview_content")
+                )
             except (OSError, DocumentFormatError) as exc:
                 self._send_json({"error": f"读取译文失败: {exc}"}, 500)
                 return
@@ -1717,6 +1786,7 @@ class Handler(BaseHTTPRequestHandler):
             content_types = {
                 ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 ".epub": "application/epub+zip",
+                ".pdf": "application/pdf",
                 ".srt": "application/x-subrip; charset=utf-8",
                 ".vtt": "text/vtt; charset=utf-8",
             }
@@ -1733,10 +1803,6 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
             return
-        elif path == "/api/test":
-            server = query.get("server", [""])[0]
-            ok, msg = test_server(server)
-            self._send_json({"ok": ok, "msg": msg})
         elif path == "/api/stream":
             job = query.get("job", [""])[0]
             with JOBS_LOCK:
@@ -1808,6 +1874,8 @@ class Handler(BaseHTTPRequestHandler):
             self._serve_file(os.path.join(STATIC_DIR, path.lstrip("/")))
 
     def do_DELETE(self):
+        if not self._request_allowed(mutating=True):
+            return
         path, query = self._request_parts()
         if path == "/api/source":
             source_id = query.get("id", [""])[0]
@@ -1891,7 +1959,19 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_POST(self):
+        if not self._request_allowed(mutating=True):
+            return
         path = self.path.split("?")[0]
+        if path == "/api/test":
+            try:
+                body = self._read_body()
+            except Exception:
+                self._send_json({"error": "bad json"}, 400)
+                return
+            server = body.get("server", "") if isinstance(body, dict) else ""
+            ok, msg = test_server(server)
+            self._send_json({"ok": ok, "msg": msg})
+            return
         if path == "/api/import":
             try:
                 body = self._read_body()

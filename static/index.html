@@ -265,7 +265,7 @@
     <div class="queue-controls">
       <div id="drop">
         <div class="big">添加文档</div>
-        <div class="small">拖入或<b>选择文件</b> · 文本 / 字幕 / DOCX / EPUB</div>
+        <div class="small">拖入或<b>选择文件</b> · 文本 / 字幕 / DOCX / EPUB / PDF</div>
       </div>
       <div class="task-actions">
         <button class="primary" id="btnGo" disabled>开始翻译</button>
@@ -592,7 +592,10 @@ async function ping(){
   dot.className='dot busy'; txt.textContent='检测中…';
   try{
     const srv = $('cfg_server').value.trim();
-    const r = await fetch('/api/test?server=' + encodeURIComponent(srv));
+    const r = await fetch('/api/test', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({server:srv}),
+    });
     const d = await r.json();
     if(d.ok){ dot.className='dot on'; txt.textContent='服务器在线 · ' + d.msg.slice(0,60); }
     else{ dot.className='dot err'; txt.textContent='连接失败 · ' + d.msg.slice(0,80); }
@@ -603,7 +606,7 @@ ping();
 /* ---------- 文件添加 ---------- */
 $('drop').addEventListener('click', () => {
   const inp = document.createElement('input'); inp.type='file'; inp.multiple=true;
-  inp.accept='.md,.txt,.text,.markdown,.srt,.vtt,.docx,.epub';
+  inp.accept='.md,.txt,.text,.markdown,.srt,.vtt,.docx,.epub,.pdf';
   inp.onchange = () => addFiles([...inp.files]);
   inp.click();
 });
@@ -616,7 +619,7 @@ $('drop').addEventListener('click', () => {
 $('drop').addEventListener('drop', e => addFiles([...e.dataTransfer.files]));
 
 const TEXT_DOCUMENT_EXTENSIONS=['.md','.txt','.text','.markdown','.srt','.vtt'];
-const BINARY_DOCUMENT_EXTENSIONS=['.docx','.epub'];
+const BINARY_DOCUMENT_EXTENSIONS=['.docx','.epub','.pdf'];
 const MAX_BINARY_FILE_BYTES=50*1024*1024;
 function fileExtension(name){ return (String(name).match(/\.[^.]+$/)?.[0]||'').toLowerCase(); }
 function normalizeTextSource(raw){
@@ -671,7 +674,7 @@ async function addFiles(list){
   for(const f of list){
     const extension=fileExtension(f.name);
     if(!TEXT_DOCUMENT_EXTENSIONS.includes(extension) && !BINARY_DOCUMENT_EXTENSIONS.includes(extension)){
-      await appAlert(`暂不支持“${f.name}”。\n\n当前支持 Markdown、纯文本、SRT、WebVTT、DOCX 和 EPUB。`,'不支持的格式');
+      await appAlert(`暂不支持“${f.name}”。\n\n当前支持 Markdown、纯文本、SRT、WebVTT、DOCX、EPUB 和带文字层的 PDF。`,'不支持的格式');
       continue;
     }
     if(BINARY_DOCUMENT_EXTENSIONS.includes(extension) && f.size>MAX_BINARY_FILE_BYTES){
@@ -810,7 +813,7 @@ function sourceLineInfo(lines, filename=''){
     return {translate:!!plain[2],prefix:plain[1],suffix:plain[3]};
   });
   const extension=(String(filename).match(/\.[^.]+$/)?.[0]||'').toLowerCase();
-  const plainDocument=['.srt','.vtt','.docx','.epub'].includes(extension);
+  const plainDocument=['.srt','.vtt','.docx','.epub','.pdf'].includes(extension);
   if(plainDocument){
     // 字幕中的 "- " 不是 Markdown 列表；容器预览行也都是已经提取的纯文本单元。
     lines.forEach((rawLine,index) => {
