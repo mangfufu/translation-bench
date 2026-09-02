@@ -8,6 +8,8 @@ output/
 inputs/
 translations/
 translated/
+.translation-state.json*
+.translation-sources/
 *.log
 
 # Local configuration and secrets
@@ -31,3 +33,4 @@ start.bat
 .idea/
 .DS_Store
 Thumbs.db
+~$*

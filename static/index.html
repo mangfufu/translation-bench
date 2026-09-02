@@ -56,6 +56,8 @@
   .fld label{display:block;margin-bottom:4px;color:var(--ink-soft);font-size:11px}
   .fld input,.fld select,.fld textarea{width:100%;min-width:0;border:1px solid #3a3a3a;border-radius:0;outline:0;background:#000;color:#fff;padding:7px 8px;font:12px var(--mono)}
   .fld input:focus,.fld select:focus,.fld textarea:focus{border-color:#fff;box-shadow:none}
+  .fld input:disabled,.fld select:disabled{opacity:.35;cursor:not-allowed}
+  .config-note{margin-top:6px;color:var(--ink-faint);font-size:10px;line-height:1.45}
   .fld textarea{display:block;min-height:82px;resize:vertical;line-height:1.6}
   .fld .row{display:flex;gap:8px}.fld .row>div{flex:1;min-width:0}
   .config-toggle{width:100%;display:flex;align-items:center;justify-content:space-between;padding:7px 9px;text-align:left;font:12px var(--mono)}
@@ -71,7 +73,7 @@
   #drop:hover,#drop.over{border-color:#fff;background:#fff;color:#000}
   #drop .big{font-weight:600;font-size:13px}#drop .small{color:var(--ink-faint);font-size:11px}#drop .small b{color:var(--verm)}
   #drop:hover .small,#drop.over .small,#drop:hover .small b,#drop.over .small b{color:#333}
-  .task-actions{display:flex;gap:7px;margin-top:10px}.task-actions #btnGo{flex:1}.task-actions button{padding:7px 10px;font-size:12px;white-space:nowrap}
+  .task-actions{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-top:10px}.task-actions button{min-width:0;padding:7px 10px;font-size:12px;white-space:nowrap}
   #progressBox{display:block;margin-top:10px}
   .progress-head{display:flex;align-items:center;justify-content:space-between;margin:5px 0 3px;color:var(--ink-faint);font:9px var(--mono)}
   .progress-head b{color:var(--ink-soft);font-weight:500;font-variant-numeric:tabular-nums}
@@ -102,12 +104,13 @@
   .file .delete:hover:not(:disabled){border-color:#fff;background:#fff;color:#000}.file .delete svg{width:14px;height:14px}
   .file.selected .delete,.file.selected .retry,.file.selected .retranslate-file,.file.selected .dl{color:#000}
   .file.selected .delete:hover:not(:disabled),.file.selected .retry:hover:not(:disabled),.file.selected .retranslate-file:hover:not(:disabled){border-color:#000;background:#000;color:#fff}
-  .queue-foot{flex:none;padding:8px 12px;border-top:1px solid var(--line-2);color:var(--ink-faint);font:10px var(--mono);background:#050505}
+  .queue-foot{flex:none;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 12px;border-top:1px solid var(--line-2);color:var(--ink-faint);font:10px var(--mono);background:#050505}
+  .queue-foot button{padding:4px 7px;font:10px var(--mono);white-space:nowrap}
 
   .detail-panel{display:flex;flex-direction:column;background:var(--paper)}
   .detail-head{height:50px;flex:none;display:flex;align-items:center;gap:12px;padding:0 16px;border-bottom:1px solid var(--line-2);background:#050505}
   .detail-title{flex:1;min-width:0}.detail-title strong{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px}.detail-title span{display:block;color:var(--ink-faint);font:10px var(--mono)}
-  .detail-actions{display:flex;gap:7px}.detail-actions button{padding:6px 10px;font-size:11px;display:inline-flex;align-items:center;gap:6px}
+  .detail-actions{display:flex;align-items:center;gap:7px}.detail-actions button{padding:6px 10px;font-size:11px;display:inline-flex;align-items:center;justify-content:center;gap:6px;white-space:nowrap}
   #detail{flex:1;min-height:0;overflow:hidden;padding:0}
   .detail-empty{height:100%;display:grid;place-items:center;border:0;border-radius:0;color:var(--ink-faint);text-align:center;background:#000}.detail-empty strong{display:block;color:var(--ink-soft);font:600 15px var(--sans);margin-bottom:4px}
   .compare-wrap{--source-w:50%;position:relative;height:100%}
@@ -197,6 +200,14 @@
           <option>学术论文</option>
           <option>轻小说网文</option>
         </select></div>
+      <div class="fld"><label>上下文模式</label>
+        <select id="cfg_context_mode">
+          <option value="full" selected>1 · 尽量全文</option>
+          <option value="neighbor">2 · 邻近上下文</option>
+          <option value="unit">3 · 独立单元</option>
+        </select>
+        <div class="config-note" id="contextModeHint"></div>
+      </div>
       <div class="fld"><div class="row">
         <div><label>源语言</label>
           <select id="cfg_src">
@@ -233,12 +244,8 @@
           </select></div>
       </div></div>
       <div class="fld"><div class="row">
-        <div><label>每批段落</label><input id="cfg_bp" type="number" value="15"></div>
-        <div><label>每批字符</label><input id="cfg_cc" type="number" value="12000"></div>
-      </div></div>
-      <div class="fld"><div class="row">
-        <div><label>参考上文字符</label><input id="cfg_context_chars" type="number" min="0" step="500" value="4000"></div>
-        <div><label>参考下文字符</label><input id="cfg_future_context_chars" type="number" min="0" step="500" value="2000"></div>
+        <div><label id="contextUnitsLabel">近期译文单元</label><input id="cfg_context_units" type="number" min="0" step="1" value="12" title="用于保持术语、称谓和语气；长文模式也作为窗口前向重叠"></div>
+        <div><label id="futureContextUnitsLabel">长文后向重叠</label><input id="cfg_future_context_units" type="number" min="0" step="1" value="6" title="仅在全文放不进上下文时，用于固定语义窗口之间的后向重叠"></div>
       </div></div>
     </div>
     </div>
@@ -258,12 +265,12 @@
     <div class="queue-controls">
       <div id="drop">
         <div class="big">添加文档</div>
-        <div class="small">拖入或<b>选择文件</b> · .md / .txt</div>
+        <div class="small">拖入或<b>选择文件</b> · 文本 / 字幕 / DOCX / EPUB</div>
       </div>
       <div class="task-actions">
         <button class="primary" id="btnGo" disabled>开始翻译</button>
-        <button class="danger" id="btnStop" hidden>中断</button>
-        <button id="btnZip" hidden>下载 ZIP</button>
+        <button class="danger" id="btnStop" disabled>中断</button>
+        <button id="btnZip" disabled>下载</button>
         <button class="quiet" id="btnClear" disabled>清空</button>
       </div>
       <div id="progressBox">
@@ -275,7 +282,7 @@
       <div id="cur"></div>
     </div>
     <div id="list"><div class="empty">尚未添加文档</div></div>
-    <div class="queue-foot">结果自动保存至 outputs\</div>
+    <div class="queue-foot"><span>结果自动保存至 outputs\</span><button class="quiet" id="btnClearCache">清除缓存</button></div>
   </section>
 
   <div class="splitter" data-split="queue" title="拖动调整任务栏宽度"></div>
@@ -287,7 +294,12 @@
         <strong id="detailName">原文 / 译文</strong>
         <span id="detailMeta">选择中间栏中的文件查看内容</span>
       </div>
-      <div class="detail-actions"><button id="btnTrack" disabled>跟随翻译进度</button></div>
+      <div class="detail-actions">
+        <button class="primary" id="btnCurrentGo" disabled>翻译当前文件</button>
+        <button class="danger" id="btnCurrentStop" disabled>中断</button>
+        <button id="btnTrack" disabled>跟随</button>
+        <button class="quiet" id="btnCurrentClear" disabled>清除译文</button>
+      </div>
     </div>
     <div id="detail">
       <div class="detail-empty"><div><strong>尚未选择文件</strong><span>从任务列表中选择一项查看对照</span></div></div>
@@ -305,10 +317,11 @@
 
 <script>
 const $ = id => document.getElementById(id);
-let files = [];       // {name, content, status, error, content_out, live_out, legacy_out, output_name}
+let files = [];       // 任务、实时行、已完成行检查点及磁盘输出状态
 let jobId = null, lastJob = null, pollTimer = null, es = null, submitting = false;
 let jobNames = [], interrupted = false;
 let selectedIdx = -1, currentName = '', trackingProgress = false;
+let interrupting = false;
 let compareRatio = 50;
 let pollBusy = false;
 let lineRetranslating = null;
@@ -407,8 +420,8 @@ function outputName(name, target){
 const CFG_FIELDS = {
   server:'cfg_server', key:'cfg_key', model:'cfg_model', ctx:'cfg_ctx',
   temp:'cfg_temp', topk:'cfg_topk', topp:'cfg_topp', rp:'cfg_rp',
-  src:'cfg_src', tgt:'cfg_tgt', style:'cfg_style', bp:'cfg_bp', cc:'cfg_cc', contextChars:'cfg_context_chars',
-  futureContextChars:'cfg_future_context_chars', sys:'cfg_sys'
+  src:'cfg_src', tgt:'cfg_tgt', style:'cfg_style', contextMode:'cfg_context_mode', contextUnits:'cfg_context_units',
+  futureContextUnits:'cfg_future_context_units', sys:'cfg_sys'
 };
 const LEGACY_SYSTEM_PROMPTS = [
   '你是专业翻译。只输出译文，保持原意、语气和格式，不要添加任何解释。',
@@ -427,8 +440,8 @@ const LEGACY_SYSTEM_PROMPTS = [
 ];
 const CFG_DEFAULTS = {
   server:'http://127.0.0.1:8081', key:'local-qwen', model:'hy-mt2-7b', ctx:65536,
-  temp:0.7, topk:20, topp:0.6, rp:1.05, src:'自动判断', tgt:'中文', style:'自动判断', bp:15, cc:12000,
-  contextChars:4000, futureContextChars:2000,
+  temp:0.7, topk:20, topp:0.6, rp:1.05, src:'自动判断', tgt:'中文', style:'自动判断',
+  contextMode:'full', contextUnits:12, futureContextUnits:6,
   thinking:false, sys:''
 };
 function setThinkingMode(enabled){
@@ -439,6 +452,27 @@ function setThinkingMode(enabled){
   button.classList.toggle('on',on);
   button.setAttribute('aria-pressed',String(on));
   button.title=on ? '模型会先进行推理，翻译通常不需要' : '直接生成译文，翻译推荐';
+}
+function updateContextModeUI(mode){
+  const selected=['full','neighbor','unit'].includes(mode) ? mode : 'full';
+  const contextInput=$('cfg_context_units');
+  const futureInput=$('cfg_future_context_units');
+  const independent=selected==='unit';
+  contextInput.disabled=independent;
+  futureInput.disabled=independent;
+  if(selected==='full'){
+    $('contextUnitsLabel').textContent='近期译文单元';
+    $('futureContextUnitsLabel').textContent='长文后向重叠';
+    $('contextModeHint').textContent='短文附带全文；放不下时自动改用固定语义窗口。每次仍只输出当前单元。';
+  }else if(selected==='neighbor'){
+    $('contextUnitsLabel').textContent='前文译文单元';
+    $('futureContextUnitsLabel').textContent='后文原文单元';
+    $('contextModeHint').textContent='只附带附近的已确认译文和后续原文，不重复发送全文。';
+  }else{
+    $('contextUnitsLabel').textContent='前文单元（已关闭）';
+    $('futureContextUnitsLabel').textContent='后文单元（已关闭）';
+    $('contextModeHint').textContent='只发送当前待译单元；用量和预填开销最低，但跨段一致性最弱。';
+  }
 }
 function readCfg(){
   const c = {};
@@ -451,8 +485,9 @@ function requestConfig(){
   return {
     server:cfg.server, api_key:cfg.key, model:cfg.model, context_size:+cfg.ctx,
     temperature:+cfg.temp, top_k:+cfg.topk, top_p:+cfg.topp, repeat_penalty:+cfg.rp,
-    batch_paras:+cfg.bp, chunk_chars:+cfg.cc, context_chars:+cfg.contextChars,
-    future_context_chars:+cfg.futureContextChars, src_lang:cfg.src, tgt_lang:cfg.tgt,
+    context_mode:cfg.contextMode,
+    context_units:+cfg.contextUnits,
+    future_context_units:+cfg.futureContextUnits, src_lang:cfg.src, tgt_lang:cfg.tgt,
     translation_style:cfg.style, system_prompt:cfg.sys,
     enable_thinking:!!cfg.thinking
   };
@@ -461,12 +496,12 @@ function writeCfg(c){
   c=c||{};
   for(const k in CFG_FIELDS) $(CFG_FIELDS[k]).value = c[k] ?? CFG_DEFAULTS[k];
   setThinkingMode(c.thinking ?? CFG_DEFAULTS.thinking);
+  updateContextModeUI($('cfg_context_mode').value);
 }
 try{
   const savedCfg = JSON.parse(localStorage.getItem('bench_cfg'));
   if(savedCfg){
     if(Number(savedCfg.ctx) === 131072) savedCfg.ctx = 65536;
-    if(Number(savedCfg.cc) === 8000) savedCfg.cc = 12000;
     // 将旧版默认模型切换到 Hy-MT2 7B；用户自行填写的其他模型名保持不变。
     if(String(savedCfg.model || '').toLowerCase() === 'hy-mt1.5-1.8b'){
       savedCfg.model = 'hy-mt2-7b';
@@ -568,7 +603,7 @@ ping();
 /* ---------- 文件添加 ---------- */
 $('drop').addEventListener('click', () => {
   const inp = document.createElement('input'); inp.type='file'; inp.multiple=true;
-  inp.accept='.md,.txt,.text,.markdown';
+  inp.accept='.md,.txt,.text,.markdown,.srt,.vtt,.docx,.epub';
   inp.onchange = () => addFiles([...inp.files]);
   inp.click();
 });
@@ -580,36 +615,181 @@ $('drop').addEventListener('click', () => {
 }));
 $('drop').addEventListener('drop', e => addFiles([...e.dataTransfer.files]));
 
+const TEXT_DOCUMENT_EXTENSIONS=['.md','.txt','.text','.markdown','.srt','.vtt'];
+const BINARY_DOCUMENT_EXTENSIONS=['.docx','.epub'];
+const MAX_BINARY_FILE_BYTES=50*1024*1024;
+function fileExtension(name){ return (String(name).match(/\.[^.]+$/)?.[0]||'').toLowerCase(); }
+function normalizeTextSource(raw){
+  let text=String(raw??''), text_bom=text.startsWith('\ufeff');
+  if(text_bom) text=text.slice(1);
+  const crlf=(text.match(/\r\n/g)||[]).length;
+  const remainder=text.replace(/\r\n/g,'');
+  const cr=(remainder.match(/\r/g)||[]).length, lf=(remainder.match(/\n/g)||[]).length;
+  const text_eol=crlf>=Math.max(cr,lf)&&crlf ? 'crlf' : (cr>lf ? 'cr' : 'lf');
+  return {content:text.replace(/\r\n/g,'\n').replace(/\r/g,'\n'),text_eol,text_bom};
+}
+async function importTextFile(file){
+  const bytes=new Uint8Array(await file.arrayBuffer());
+  const hasUtf8Bom=bytes.length>=3 && bytes[0]===0xef && bytes[1]===0xbb && bytes[2]===0xbf;
+  if(bytes.length>=2 && ((bytes[0]===0xff&&bytes[1]===0xfe)||(bytes[0]===0xfe&&bytes[1]===0xff))){
+    throw new Error('暂不支持 UTF-16 文本，请先另存为 UTF-8');
+  }
+  let decoded;
+  try{ decoded=new TextDecoder('utf-8',{fatal:true}).decode(bytes); }
+  catch(_){ throw new Error('文本不是有效的 UTF-8 编码'); }
+  const normalized=normalizeTextSource(decoded);
+  normalized.text_bom=hasUtf8Bom;
+  return {...normalized,source_id:null,source_format:'text',source_sha256:null};
+}
+function arrayBufferToBase64(buffer){
+  const bytes=new Uint8Array(buffer), chunks=[];
+  for(let offset=0;offset<bytes.length;offset+=0x8000){
+    chunks.push(String.fromCharCode(...bytes.subarray(offset,offset+0x8000)));
+  }
+  return btoa(chunks.join(''));
+}
+async function importBinaryFile(file){
+  $('cur').textContent='正在导入：' + file.name;
+  const encoded=arrayBufferToBase64(await file.arrayBuffer());
+  const response=await fetch('/api/import', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({name:file.name,data_base64:encoded})
+  });
+  const result=await response.json().catch(() => ({}));
+  if(!response.ok || !result.ok) throw new Error(result.error || `HTTP ${response.status}`);
+  return result;
+}
+async function releaseSource(file){
+  if(!file?.source_id) return true;
+  try{
+    const response=await fetch('/api/source?id=' + encodeURIComponent(file.source_id), {method:'DELETE'});
+    return response.ok;
+  }catch(_){ return false; }
+}
+
 async function addFiles(list){
   for(const f of list){
-    const content = await f.text();
-    const existing = files.find(x => x.name === f.name);
+    const extension=fileExtension(f.name);
+    if(!TEXT_DOCUMENT_EXTENSIONS.includes(extension) && !BINARY_DOCUMENT_EXTENSIONS.includes(extension)){
+      await appAlert(`暂不支持“${f.name}”。\n\n当前支持 Markdown、纯文本、SRT、WebVTT、DOCX 和 EPUB。`,'不支持的格式');
+      continue;
+    }
+    if(BINARY_DOCUMENT_EXTENSIONS.includes(extension) && f.size>MAX_BINARY_FILE_BYTES){
+      await appAlert(`“${f.name}”超过 50MB，无法导入。`,'文件过大');
+      continue;
+    }
+    const existing = files.find(x => x.name.toLocaleLowerCase() === f.name.toLocaleLowerCase());
+    let imported;
+    try{
+      if(BINARY_DOCUMENT_EXTENSIONS.includes(extension)){
+        imported=await importBinaryFile(f);
+      }else{
+        imported=await importTextFile(f);
+      }
+    }catch(error){
+      await appAlert(`导入“${f.name}”失败：${error.message}`,'导入失败');
+      continue;
+    }
+    const content=imported.content;
     if(existing){
-      // 刷新恢复或接口提交的任务可能只有文件名；重新添加时补回原文。
-      if(typeof existing.content !== 'string') existing.content = content;
+      if(jobId || submitting || lineRetranslating || lineSaving || lineEditing){
+        if(imported.source_id) await releaseSource(imported);
+        await appAlert('任务运行或译文编辑期间不能替换同名文件。','暂时无法替换');
+        continue;
+      }
+      const binary=BINARY_DOCUMENT_EXTENSIONS.includes(extension);
+      const sourceChanged=existing.name!==f.name || (binary
+        ? (existing.source_sha256
+          ? existing.source_sha256!==imported.source_sha256
+          : existing.content!==content)
+        : existing.content!==content || (existing.text_eol||'lf')!==(imported.text_eol||'lf') ||
+          !!existing.text_bom!==!!imported.text_bom);
+      if(sourceChanged){
+        const replace=await appConfirm(
+          `任务列表中已有同名文件“${f.name}”。\n\n是否用新文件替换？现有预览、译文状态和续译断点将被清除，已保存的磁盘译文不会自动删除。`,
+          '替换同名文件'
+        );
+        if(!replace){
+          if(imported.source_id) await releaseSource(imported);
+          continue;
+        }
+      }
+      if(existing.source_id && existing.source_id!==imported.source_id) await releaseSource(existing);
+      existing.name=f.name;
+      existing.content=content;
+      existing.source_id=imported.source_id||null;
+      existing.source_format=imported.source_format||'text';
+      existing.source_sha256=imported.source_sha256||null;
+      existing.text_eol=imported.text_eol||'lf';
+      existing.text_bom=!!imported.text_bom;
+      if(sourceChanged){
+        existing.status='q'; existing.error=''; existing.content_out=null;
+        existing.live_out={}; existing.completed_lines={}; existing.resume_retranslate=false;
+        existing.legacy_out=''; existing.output_name=null; existing.target_language=null;
+        existing.priority=false; existing.retry_queued=false;
+      }
       continue;
     }
     files.push({name:f.name, content, status:'q', error:'', content_out:null,
-      live_out:{}, legacy_out:'', output_name:null, target_language:null, priority:false, retry_queued:false});
+      live_out:{}, completed_lines:{}, resume_retranslate:false, legacy_out:'',
+      output_name:null, target_language:null, priority:false, retry_queued:false,
+      source_id:imported.source_id||null, source_format:imported.source_format||'text',
+      source_sha256:imported.source_sha256||null, text_eol:imported.text_eol||'lf',
+      text_bom:!!imported.text_bom});
   }
+  $('cur').textContent='';
   if(selectedIdx < 0 && files.length) selectedIdx = 0;
   render();
   markOutputsDone();   // 标记后台已翻译过的文件
 }
-$('btnClear').addEventListener('click', () => {
+$('btnClear').addEventListener('click', async () => {
+  if(!files.length || jobId || submitting || lineRetranslating || lineSaving || lineEditing) return;
+  const confirmed=await appConfirm(
+    `清空任务列表中的 ${files.length} 个文件？\n\n未完成译文和续译断点会从浏览器中移除，outputs 中已经保存的译文不会删除。`,
+    '清空任务列表'
+  );
+  if(!confirmed) return;
+  await Promise.allSettled(files.map(releaseSource));
   files=[]; selectedIdx=-1;
   updateTotalProgress(0,0); updateFileProgress(0,0);
   $('cur').textContent='';
   render();
+});
+$('btnClearCache').addEventListener('click', async () => {
+  if(jobId || submitting || lineRetranslating || lineSaving || lineEditing) return;
+  const completed = files.filter(file => file.status === 'ok').length;
+  const confirmed = await appConfirm(
+    `清除完成记录和恢复缓存？${completed ? `\n\n任务列表中将移除 ${completed} 个已完成任务。` : ''}\n\noutputs 中的实际译文不会被删除。`,
+    '清除缓存'
+  );
+  if(!confirmed) return;
+  try{
+    const response = await fetch('/api/cache', {method:'DELETE'});
+    const result = await response.json();
+    if(!response.ok || !result.ok) throw new Error(result.error || `HTTP ${response.status}`);
+    const selectedFile = files[selectedIdx] || null;
+    await Promise.allSettled(files.filter(file => file.status === 'ok').map(releaseSource));
+    files = files.filter(file => file.status !== 'ok');
+    selectedIdx = selectedFile && files.includes(selectedFile)
+      ? files.indexOf(selectedFile)
+      : (files.length ? 0 : -1);
+    lastJob=null; currentName=''; trackingProgress=false;
+    localStorage.removeItem('bench_lastjob');
+    updateTotalProgress(0,0); updateFileProgress(0,0);
+    $('cur').textContent='缓存已清除，磁盘译文已保留';
+    render();
+  }catch(error){
+    await appAlert('清除缓存失败：' + error.message,'清除失败');
+  }
 });
 
 /* ---------- 渲染 ---------- */
 function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 function escAttr(s){ return esc(s).replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
 
-function sourceLineInfo(lines){
+function sourceLineInfo(lines, filename=''){
   let inFence=false;
-  return lines.map(rawLine => {
+  const info=lines.map(rawLine => {
     // File.text() 会保留 Windows CRLF 中的 \r；先去掉物理行尾，避免正则匹配失败。
     const line=String(rawLine).replace(/\r$/,'');
     if(/^(\s*)(```|~~~)/.test(line)){ inFence=!inFence; return {translate:false,prefix:'',suffix:''}; }
@@ -629,6 +809,45 @@ function sourceLineInfo(lines){
     if(!plain) return {translate:false,prefix:'',suffix:''};
     return {translate:!!plain[2],prefix:plain[1],suffix:plain[3]};
   });
+  const extension=(String(filename).match(/\.[^.]+$/)?.[0]||'').toLowerCase();
+  const plainDocument=['.srt','.vtt','.docx','.epub'].includes(extension);
+  if(plainDocument){
+    // 字幕中的 "- " 不是 Markdown 列表；容器预览行也都是已经提取的纯文本单元。
+    lines.forEach((rawLine,index) => {
+      const line=String(rawLine).replace(/\r$/,'');
+      const plain=line.match(/^(\s*)(.*?)([ \t]*)$/);
+      info[index]=plain && plain[2]
+        ? {translate:true,prefix:plain[1],suffix:plain[3]}
+        : {translate:false,prefix:'',suffix:''};
+    });
+  }
+  if(extension!=='.srt' && extension!=='.vtt') return info;
+  const preserve=index => { info[index]={translate:false,prefix:'',suffix:''}; };
+  const timestamp=/^\s*(?:\d{1,3}:)?\d{2}:\d{2}[,.]\d{3}\s+-->\s+(?:\d{1,3}:)?\d{2}:\d{2}[,.]\d{3}(?:\s+.*)?$/;
+  if(extension==='.vtt' && lines.length && String(lines[0]).replace(/^\uFEFF/,'').trim().startsWith('WEBVTT')){
+    for(let i=0;i<lines.length;i++){
+      preserve(i);
+      if(i>0 && !String(lines[i]).trim()) break;
+    }
+  }
+  let block=false;
+  lines.forEach((rawLine,index) => {
+    const line=String(rawLine).replace(/\r$/,'');
+    const stripped=line.trim();
+    if(extension==='.vtt'){
+      if(/^(?:NOTE(?:\s|$)|STYLE$|REGION$)/.test(stripped)) block=true;
+      if(block){ preserve(index); if(!stripped) block=false; return; }
+    }
+    if(!stripped){ preserve(index); return; }
+    if(timestamp.test(line)){
+      preserve(index);
+      if(index>0 && String(lines[index-1]).trim()){
+        const previous=String(lines[index-1]).trim();
+        if(extension==='.vtt' || /^\d+$/.test(previous)) preserve(index-1);
+      }
+    }
+  });
+  return info;
 }
 
 function translatedLineBody(info, translatedLine){
@@ -646,7 +865,7 @@ function splitHtml(i){
   const completed = f.content_out !== null;
   const dst = completed ? String(f.content_out).split('\n') : [];
   const live = f.live_out || {};
-  const lineInfo = sourceLineInfo(src);
+  const lineInfo = sourceLineInfo(src, f.name);
   // 兼容修复前已在运行的后端：旧 chunk 没有物理行号，按非空行顺序对齐。
   const legacy = {};
   if(!completed && !Object.keys(live).length && f.legacy_out){
@@ -662,7 +881,10 @@ function splitHtml(i){
     ...Object.keys(legacy).map(Number).map(x=>x+1), 0);
   for(let k=0;k<n;k++){
     const s = src[k] || '';
-    const d = completed ? (dst[k] || '') : (live[k] || legacy[k] || '');
+    // 整篇重译时保留旧译文作底稿，但当前行一旦收到新 token 就立即
+    // 覆盖显示；其他尚未开始的行仍保持旧译文，不会突然清空全文。
+    const hasLive = Object.prototype.hasOwnProperty.call(live, String(k));
+    const d = hasLive ? live[k] : (completed ? (dst[k] || '') : (legacy[k] || ''));
     if(!s.trim() && !d.trim()) continue;
     const isBusy = lineRetranslating && lineRetranslating.name===f.name && lineRetranslating.line===k;
     const lineButton = completed && lineInfo[k]?.translate
@@ -689,13 +911,11 @@ function render(){
     : (failedRunnable.length === runnable.length && failedRunnable.length
       ? `重试失败（${failedRunnable.length}）`
       : (failedRunnable.length ? `继续并重试（${runnable.length}）` : '开始翻译')));
-  $('btnStop').hidden = !jobId;
-  $('btnZip').hidden = !lastJob;
+  $('btnStop').disabled = !jobId || interrupting;
+  $('btnStop').textContent = interrupting ? '正在中断…' : '中断';
   $('btnZip').disabled = !lastJob || !!lineRetranslating || lineSaving || !!lineEditing;
   $('btnClear').disabled = files.length === 0 || !!jobId || !!lineRetranslating || lineSaving || !!lineEditing;
-  $('btnTrack').disabled = !jobId || !currentName;
-  $('btnTrack').classList.toggle('on', trackingProgress);
-  $('btnTrack').textContent = trackingProgress ? '停止跟随' : '跟随翻译进度';
+  $('btnClearCache').disabled = !!jobId || submitting || !!lineRetranslating || lineSaving || !!lineEditing;
   const list = $('list');
   if(files.length === 0){
     taskListScrollTop = 0;
@@ -825,6 +1045,7 @@ async function deleteFile(i){
       return;
     }
   }
+  await releaseSource(f);
   const selectedFile = files[selectedIdx] || null;
   files.splice(i, 1);
   if(selectedFile === f){
@@ -848,7 +1069,7 @@ async function selectFile(i){
   if(trackingProgress){
     trackingProgress=false;
     $('btnTrack').classList.remove('on');
-    $('btnTrack').textContent='跟随翻译进度';
+    $('btnTrack').textContent='跟随';
   }
   if(previousIdx !== i){
     const previousRow = document.querySelector(`.file[data-fi="${previousIdx}"]`);
@@ -861,10 +1082,36 @@ async function selectFile(i){
 }
 function detailMetaFor(f){
   const labels={q:'待翻译',run:'翻译中',ok:'已完成',err:'翻译失败'};
+  if(BINARY_DOCUMENT_EXTENSIONS.includes(fileExtension(f.name))){
+    const units=typeof f.content==='string' && f.content ? f.content.split('\n').length : 0;
+    return `${labels[f.status]||'待翻译'} · ${String(f.source_format||fileExtension(f.name).slice(1)).toUpperCase()} · ${units} 个文本单元`;
+  }
   return `${labels[f.status]||'待翻译'} · ${(((f.content||'').length)/1024).toFixed(1)} KB`;
+}
+function updateDetailControls(){
+  const f=files[selectedIdx];
+  const hasSource=!!f && typeof f.content==='string';
+  const selectedIsRunning=!!jobId && !!f && f.name===currentName;
+  const blocked=!!jobId || submitting || !!lineRetranslating || lineSaving || !!lineEditing;
+  const currentGo=$('btnCurrentGo');
+  if(f?.resume_retranslate) currentGo.textContent='继续重译当前文件';
+  else if(Object.keys(f?.completed_lines||{}).length) currentGo.textContent='继续翻译当前文件';
+  else currentGo.textContent=f?.status==='ok' && f.content_out!==null ? '重译当前文件' : '翻译当前文件';
+  currentGo.disabled=!hasSource || blocked;
+  $('btnCurrentStop').disabled=!selectedIsRunning || interrupting;
+  $('btnCurrentStop').textContent=interrupting && selectedIsRunning ? '正在中断…' : '中断';
+  $('btnTrack').disabled=!selectedIsRunning;
+  $('btnTrack').classList.toggle('on', trackingProgress && selectedIsRunning);
+  $('btnTrack').textContent=trackingProgress && selectedIsRunning ? '停止跟随' : '跟随';
+  const hasTranslation=!!f && (
+    f.content_out!==null || Object.keys(f.live_out||{}).length>0 ||
+    Object.keys(f.completed_lines||{}).length>0 || !!f.legacy_out
+  );
+  $('btnCurrentClear').disabled=!hasTranslation || blocked;
 }
 function renderDetail(){
   const detail = $('detail'), f = files[selectedIdx];
+  updateDetailControls();
   if(!f){
     $('detailName').textContent = '原文 / 译文';
     $('detailMeta').textContent = '选择中间栏中的文件查看内容';
@@ -893,6 +1140,10 @@ function lockTaskControlsForLineEdit(){
   $('btnGo').disabled=true;
   $('btnClear').disabled=true;
   $('btnZip').disabled=true;
+  $('btnCurrentGo').disabled=true;
+  $('btnCurrentStop').disabled=true;
+  $('btnTrack').disabled=true;
+  $('btnCurrentClear').disabled=true;
   document.querySelectorAll('.file-actions button,.pri,.line-retranslate').forEach(button => {
     button.disabled=true;
   });
@@ -903,7 +1154,7 @@ function startLineEdit(line, cell){
   const f=files[selectedIdx];
   if(!f || f.content_out === null || typeof f.content !== 'string') return;
   const sourceLines=f.content.split('\n');
-  const info=sourceLineInfo(sourceLines)[line];
+  const info=sourceLineInfo(sourceLines, f.name)[line];
   if(!info?.translate) return;
   const translatedLines=String(f.content_out).split('\n');
   lineEditing={name:f.name,line};
@@ -952,7 +1203,10 @@ async function saveLineEdit(line){
       method:'POST', headers:{'Content-Type':'application/json'},
       body:JSON.stringify({
         config:requestConfig(), name:f.name, content:f.content,
-        translated_content:f.content_out, line, text:editedText
+        translated_content:f.content_out, line, text:editedText,
+        source_id:f.source_id||null, source_format:f.source_format||'text',
+        source_sha256:f.source_sha256||null, text_eol:f.text_eol||'lf',
+        text_bom:!!f.text_bom
       })
     });
     const result=await response.json().catch(() => ({}));
@@ -994,7 +1248,10 @@ async function retranslateLine(line){
       method:'POST', headers:{'Content-Type':'application/json'},
       body:JSON.stringify({
         config:requestConfig(), name:f.name, content:f.content,
-        translated_content:f.content_out, line
+        translated_content:f.content_out, line,
+        source_id:f.source_id||null, source_format:f.source_format||'text',
+        source_sha256:f.source_sha256||null, text_eol:f.text_eol||'lf',
+        text_bom:!!f.text_bom
       })
     });
     const result=await response.json().catch(() => ({}));
@@ -1111,29 +1368,119 @@ function setChip(i, status){
   const stMap = {q:['待译','q'], run:['翻译中','run'], ok:['完成','ok'], err:['失败','err']};
   const [label, cls] = stMap[status] || ['待译','q'];
   chip.textContent = label; chip.className = 'st ' + cls;
-  if(i===selectedIdx) $('detailMeta').textContent=detailMetaFor(files[i]);
+  if(i===selectedIdx){
+    $('detailMeta').textContent=detailMetaFor(files[i]);
+    updateDetailControls();
+  }
 }
 
 /* ---------- 持久化: 刷新后恢复文件列表与译文 ---------- */
+let persistTimer=null;
+let stateDbPromise=null;
+function openStateDb(){
+  if(!('indexedDB' in window)) return Promise.reject(new Error('IndexedDB unavailable'));
+  if(stateDbPromise) return stateDbPromise;
+  stateDbPromise=new Promise((resolve,reject) => {
+    const request=indexedDB.open('translation-bench-state',1);
+    request.onupgradeneeded=() => {
+      if(!request.result.objectStoreNames.contains('state')) request.result.createObjectStore('state');
+    };
+    request.onsuccess=() => resolve(request.result);
+    request.onerror=() => reject(request.error||new Error('IndexedDB open failed'));
+  });
+  return stateDbPromise;
+}
+async function saveIndexedFiles(data){
+  const db=await openStateDb();
+  await new Promise((resolve,reject) => {
+    const transaction=db.transaction('state','readwrite');
+    transaction.objectStore('state').put(data,'files');
+    transaction.oncomplete=resolve;
+    transaction.onerror=() => reject(transaction.error||new Error('IndexedDB write failed'));
+    transaction.onabort=() => reject(transaction.error||new Error('IndexedDB write aborted'));
+  });
+}
+async function loadIndexedFiles(){
+  const db=await openStateDb();
+  return new Promise((resolve,reject) => {
+    const transaction=db.transaction('state','readonly');
+    const request=transaction.objectStore('state').get('files');
+    request.onsuccess=() => resolve(request.result||null);
+    request.onerror=() => reject(request.error||new Error('IndexedDB read failed'));
+  });
+}
+function persistentSnapshot(){
+  return files.map(f => ({name:f.name, status:f.status, error:f.error, content_out:f.content_out,
+    content:f.content, live_out:{...(f.live_out||{})}, completed_lines:{...(f.completed_lines||{})},
+    resume_retranslate:!!f.resume_retranslate, legacy_out:f.legacy_out||'', output_name:f.output_name||null,
+    target_language:f.target_language||null, priority:f.priority||false, retry_queued:!!f.retry_queued,
+    source_id:f.source_id||null, source_format:f.source_format||'text', source_sha256:f.source_sha256||null,
+    text_eol:f.text_eol||'lf', text_bom:!!f.text_bom}));
+}
 function persist(){
   try{
-    const data = files.map(f => ({name:f.name, status:f.status, error:f.error, content_out:f.content_out,
-      content:f.content, live_out:f.live_out||{}, legacy_out:f.legacy_out||'', output_name:f.output_name||null,
-      target_language:f.target_language||null, priority:f.priority||false, retry_queued:!!f.retry_queued}));
-    let s = JSON.stringify(data);
-    if(s.length > 3200000){ data.forEach(d => { delete d.content; delete d.live_out; delete d.legacy_out; }); s = JSON.stringify(data); }
-    localStorage.setItem('bench_files', s);
+    const data=persistentSnapshot();
+    saveIndexedFiles(data).catch(() => {});
+    let compact=data, serialized=JSON.stringify(compact);
+    if(serialized.length>3200000){
+      compact=data.map(item => {
+        const copy={...item};
+        if(copy.source_format!=='text') delete copy.content;
+        delete copy.live_out;
+        delete copy.legacy_out;
+        if(copy.status==='ok'&&copy.output_name) delete copy.content_out;
+        return copy;
+      });
+      serialized=JSON.stringify(compact);
+    }
+    // 超大状态以 IndexedDB 为准；不用一份丢了原文/检查点的
+    // localStorage 快照覆盖上一份尚可恢复的数据。
+    if(serialized.length<=3200000) localStorage.setItem('bench_files',serialized);
   }catch(e){}
 }
-function restoreFiles(){
+function schedulePersist(){
+  if(persistTimer) return;
+  persistTimer=setTimeout(() => { persistTimer=null; persist(); }, 750);
+}
+function flushPersist(){
+  if(persistTimer){ clearTimeout(persistTimer); persistTimer=null; }
+  persist();
+}
+document.addEventListener('visibilitychange', () => {
+  if(document.visibilityState==='hidden') flushPersist();
+});
+window.addEventListener('beforeunload', flushPersist);
+async function restoreFiles(){
   try{
-    const saved = JSON.parse(localStorage.getItem('bench_files'));
+    let saved=await loadIndexedFiles().catch(() => null);
+    if(!Array.isArray(saved)) saved=JSON.parse(localStorage.getItem('bench_files'));
     if(Array.isArray(saved)){
-      files = saved.map(f => ({name:f.name, status:f.status||'q', error:f.error||'',
-        content_out:f.content_out ?? null,
-        content:Object.prototype.hasOwnProperty.call(f,'content') ? f.content : null,
-        live_out:f.live_out||{}, legacy_out:f.legacy_out||f.out||'', output_name:f.output_name||null,
-        target_language:f.target_language||null, priority:!!f.priority, retry_queued:!!f.retry_queued}));
+      files = saved.map(f => {
+        const sourceFormat=f.source_format||'text';
+        let content=Object.prototype.hasOwnProperty.call(f,'content') ? f.content : null;
+        let textEol=f.text_eol||'lf', textBom=!!f.text_bom;
+        if(sourceFormat==='text' && typeof content==='string'){
+          const normalized=normalizeTextSource(content);
+          content=normalized.content;
+          if(!f.text_eol) textEol=normalized.text_eol;
+          if(!Object.prototype.hasOwnProperty.call(f,'text_bom')) textBom=normalized.text_bom;
+        }
+        const contentOut=typeof f.content_out==='string'
+          ? normalizeTextSource(f.content_out).content
+          : (f.content_out ?? null);
+        const completedLines=f.completed_lines||{};
+        const liveOut=Object.prototype.hasOwnProperty.call(f,'live_out')
+          ? (f.live_out||{})
+          : {...completedLines};
+        return {name:f.name, status:f.status||'q', error:f.error||'',
+          content_out:contentOut, content,
+          live_out:liveOut, completed_lines:completedLines,
+          resume_retranslate:!!f.resume_retranslate,
+          legacy_out:f.legacy_out||f.out||'', output_name:f.output_name||null,
+          target_language:f.target_language||null, priority:!!f.priority, retry_queued:!!f.retry_queued,
+          source_id:f.source_id||null, source_format:sourceFormat,
+          source_sha256:f.source_sha256||null, text_eol:textEol, text_bom:textBom};
+      });
       if(files.length) render();
     }
   }catch(e){}
@@ -1141,6 +1488,15 @@ function restoreFiles(){
 async function markOutputsDone(){
   // 仅在源文哈希和目标语言都一致时恢复，避免同名旧译文被误用。
   try{
+    for(const f of files){
+      if(typeof f.content==='string' || !f.source_id ||
+        !BINARY_DOCUMENT_EXTENSIONS.includes(fileExtension(f.name))) continue;
+      const sourceResponse=await fetch('/api/source?id=' + encodeURIComponent(f.source_id) +
+        '&format=' + encodeURIComponent(f.source_format||fileExtension(f.name).slice(1)) +
+        '&sha256=' + encodeURIComponent(f.source_sha256||''));
+      const source=await sourceResponse.json().catch(() => ({}));
+      if(sourceResponse.ok && typeof source.content==='string') f.content=source.content;
+    }
     const r = await fetch('/api/history');
     const d = await r.json();
     const outs = new Map((d.files||[]).map(f => [f.name,f]));
@@ -1150,15 +1506,19 @@ async function markOutputsDone(){
       if(f.content_out !== null || typeof f.content !== 'string') continue;
       const outName = outputName(f.name, target), entry = outs.get(outName);
       if(!entry || entry.source_name !== f.name || entry.target_language !== target || !entry.source_sha256) continue;
-      const bytes = new TextEncoder().encode(f.content);
-      const hash = [...new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))]
-        .map(b => b.toString(16).padStart(2,'0')).join('');
+      let hash=f.source_sha256||'';
+      if(!hash){
+        const bytes = new TextEncoder().encode(f.content);
+        hash = [...new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))]
+          .map(b => b.toString(16).padStart(2,'0')).join('');
+      }
       if(hash !== entry.source_sha256) continue;
       const rr = await fetch('/api/output?name=' + encodeURIComponent(outName));
       const restored = await rr.json();
       if(!rr.ok || typeof restored.content !== 'string') continue;
       f.status = 'ok'; f.content_out = restored.content; f.output_name = outName;
-      f.target_language = target; f.live_out = {}; f.legacy_out = '';
+      f.target_language = target; f.live_out = {}; f.completed_lines = {};
+      f.resume_retranslate = false; f.legacy_out = '';
       changed = true;
     }
     if(changed) render();
@@ -1173,12 +1533,24 @@ function connectSSE(jid){
     const d = JSON.parse(e.data); const fi = fileIdx(d.file);
     if(fi >= 0) appendOut(fi, d.text||'', d.line);
   });
+  es.addEventListener('line_done', e => {
+    try{
+      const d=JSON.parse(e.data), fi=fileIdx(d.file);
+      if(fi >= 0){
+        appendOut(fi, d.text||'', d.line);
+        files[fi].completed_lines=files[fi].completed_lines||{};
+        files[fi].completed_lines[String(d.line)]=d.text||'';
+        schedulePersist();
+      }
+    }catch(_){}
+  });
   es.addEventListener('fail', e => {
     try{
       const d = JSON.parse(e.data), fi = fileIdx(d.file);
       if(fi >= 0){
         files[fi].error=d.msg||'翻译失败';
-        files[fi].live_out={}; files[fi].legacy_out='';
+        files[fi].live_out={...(files[fi].completed_lines||{})};
+        files[fi].legacy_out='';
         setChip(fi,'err'); render();
       }
     }catch(_){}
@@ -1187,7 +1559,9 @@ function connectSSE(jid){
     try{
       const d = JSON.parse(e.data), fi = fileIdx(d.file);
       if(fi >= 0){
-        files[fi].live_out={}; files[fi].legacy_out=''; files[fi].error='';
+        // 兼容仍在运行的旧后端：旧版本中断时会发送 file_reset。
+        // 这里只恢复任务状态，绝不能再删除已经显示的译文。
+        files[fi].error='';
         setChip(fi,'q'); render();
       }
     }catch(_){}
@@ -1196,7 +1570,7 @@ function connectSSE(jid){
     try{
       const d = JSON.parse(e.data), fi = fileIdx(d.current);
       currentName = d.current || currentName;
-      $('btnTrack').disabled = !currentName;
+      updateDetailControls();
       $('cur').textContent = d.current ? '正在翻译：' + d.current + ' …' : '';
       updateTotalProgress(d.done, d.total);
       updateFileProgress(0, 0);
@@ -1238,6 +1612,15 @@ function syncPriority(){
   fetch('/api/prioritize', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({job:jobId, names})}).catch(()=>{});
 }
 
+function resumableLines(f){
+  const completed=f?.completed_lines||{};
+  const result={};
+  for(const [line,text] of Object.entries(completed)){
+    if(typeof text==='string' && text.trim()) result[String(line)]=text;
+  }
+  return result;
+}
+
 async function submitJob(subFiles, {retranslate=false}={}){
   if(submitting || jobId || lineRetranslating || lineSaving || lineEditing || !subFiles.length) return;
   submitting = true;
@@ -1249,11 +1632,22 @@ async function submitJob(subFiles, {retranslate=false}={}){
     await appAlert('启动失败：无法渲染任务内容，请重新添加文件后重试。','启动失败');
     return;
   }
+  const submissionPlans=subFiles.map(f => {
+    const wantsRetranslate=!!retranslate || !!f.resume_retranslate;
+    const canResume=!retranslate || !!f.resume_retranslate;
+    return {f, wantsRetranslate, resume:canResume ? resumableLines(f) : {}};
+  });
   const payload = {
     config:requestConfig(),
-    files: subFiles.map(f => {
-      const item={name:f.name, content:f.content};
-      if(retranslate){
+    files: submissionPlans.map(({f,wantsRetranslate,resume}) => {
+      const item={
+        name:f.name, content:f.content,
+        source_id:f.source_id||null, source_format:f.source_format||'text',
+        source_sha256:f.source_sha256||null, text_eol:f.text_eol||'lf',
+        text_bom:!!f.text_bom
+      };
+      if(Object.keys(resume).length) item.resume_lines=resume;
+      if(wantsRetranslate){
         item.retranslate=true;
         item.translated_content=typeof f.content_out==='string' ? f.content_out : '';
       }
@@ -1272,8 +1666,11 @@ async function submitJob(subFiles, {retranslate=false}={}){
     if(!r.ok || d.error || !d.job) throw new Error(d.error || `HTTP ${r.status}`);
     jobId = d.job; jobNames = subFiles.map(f => f.name);
     interrupted = false; currentName = ''; lastJob = null;
-    subFiles.forEach(f => { f.status='q'; f.error=''; f.live_out={}; f.legacy_out='';
-      if(!retranslate){ f.content_out=null; f.output_name=null; f.target_language=null; }
+    interrupting = false;
+    submissionPlans.forEach(({f,wantsRetranslate,resume}) => {
+      f.status='q'; f.error=''; f.live_out={...resume}; f.completed_lines={...resume};
+      f.resume_retranslate=wantsRetranslate; f.legacy_out='';
+      if(!wantsRetranslate){ f.content_out=null; f.output_name=null; f.target_language=null; }
       f.retry_queued=false;
     });
     updateTotalProgress(0, subFiles.length);
@@ -1294,16 +1691,70 @@ async function submitJob(subFiles, {retranslate=false}={}){
 }
 
 $('btnGo').addEventListener('click', () => submitJob(unfinishedFiles()));
-$('btnStop').addEventListener('click', () => {
-  if(!jobId) return;
-  fetch('/api/interrupt', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({job:jobId})}).catch(()=>{});
-  $('btnStop').disabled = true;
-  $('btnStop').textContent = '正在中断…';
+$('btnCurrentGo').addEventListener('click', () => {
+  const f=files[selectedIdx];
+  if(!f || typeof f.content!=='string' || jobId || submitting) return;
+  if(f.resume_retranslate) submitJob([f], {retranslate:true});
+  else if(f.status==='ok' && f.content_out!==null) retranslateFile(selectedIdx);
+  else submitJob([f]);
 });
+async function clearCurrentTranslation(){
+  if(jobId || submitting || lineRetranslating || lineSaving || lineEditing) return;
+  const f=files[selectedIdx];
+  if(!f) return;
+  const hasTranslation=f.content_out!==null || Object.keys(f.live_out||{}).length ||
+    Object.keys(f.completed_lines||{}).length || !!f.legacy_out;
+  if(!hasTranslation) return;
+  const diskName=f.output_name || (f.content_out!==null
+    ? outputName(f.name, f.target_language || $('cfg_tgt').value)
+    : '');
+  const confirmed=await appConfirm(
+    `清除“${f.name}”的当前译文？\n\n译文预览、续译断点${diskName ? `和磁盘文件 ${diskName}` : ''}都会删除，原文和任务仍会保留。`,
+    '清除当前译文'
+  );
+  if(!confirmed) return;
+  if(diskName){
+    try{
+      const response=await fetch('/api/output?name=' + encodeURIComponent(diskName), {method:'DELETE'});
+      const result=await response.json();
+      if(!response.ok || !result.ok) throw new Error(result.error || `HTTP ${response.status}`);
+    }catch(error){
+      await appAlert('清除磁盘译文失败：' + error.message,'清除失败');
+      return;
+    }
+  }
+  f.status='q'; f.error=''; f.content_out=null; f.live_out={};
+  f.completed_lines={}; f.resume_retranslate=false; f.legacy_out='';
+  f.output_name=null; f.target_language=null; f.retry_queued=false;
+  $('cur').textContent=`已清除译文：${f.name}`;
+  render();
+}
+$('btnCurrentClear').addEventListener('click', clearCurrentTranslation);
+async function interruptActiveJob(){
+  if(!jobId || interrupting) return;
+  const interruptedJob=jobId;
+  interrupting=true;
+  render();
+  try{
+    const response=await fetch('/api/interrupt', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({job:interruptedJob})
+    });
+    const result=await response.json().catch(() => ({}));
+    if(!response.ok || !result.ok) throw new Error(result.error || `HTTP ${response.status}`);
+  }catch(error){
+    if(jobId===interruptedJob){ interrupting=false; render(); }
+    await appAlert('中断失败：' + error.message,'中断失败');
+  }
+}
+$('btnStop').addEventListener('click', interruptActiveJob);
+$('btnCurrentStop').addEventListener('click', interruptActiveJob);
 $('btnTrack').addEventListener('click', () => {
+  const selected=files[selectedIdx];
+  if(!jobId || !selected || selected.name!==currentName) return;
   trackingProgress=!trackingProgress;
   $('btnTrack').classList.toggle('on', trackingProgress);
-  $('btnTrack').textContent=trackingProgress ? '停止跟随' : '跟随翻译进度';
+  $('btnTrack').textContent=trackingProgress ? '停止跟随' : '跟随';
   if(trackingProgress) focusCurrentProgress();
 });
 
@@ -1317,6 +1768,24 @@ function applyPartials(partials){
   }
 }
 
+function applyCompletedPartials(completed){
+  let changed=false;
+  for(const [name, lines] of Object.entries(completed||{})){
+    const fi=fileIdx(name); if(fi < 0) continue;
+    files[fi].completed_lines=files[fi].completed_lines||{};
+    for(const [line,text] of Object.entries(lines||{})){
+      if(files[fi].completed_lines[String(line)]!==text){
+        files[fi].completed_lines[String(line)]=text;
+        changed=true;
+      }
+      if((files[fi].live_out||{})[String(line)]!==text){
+        appendOut(fi,text,Number(line));
+      }
+    }
+  }
+  if(changed) persist();
+}
+
 function applyResults(results){
   (results||[]).forEach(res => {
     const fi = fileIdx(res.name); if(fi < 0) return;
@@ -1324,7 +1793,8 @@ function applyResults(results){
       files[fi].content_out = res.content;
       files[fi].output_name = res.output_name || outputName(res.name, readCfg().tgt);
       files[fi].target_language = res.target_language || readCfg().tgt;
-      files[fi].live_out = {}; files[fi].legacy_out = '';
+      files[fi].live_out = {}; files[fi].completed_lines = {};
+      files[fi].resume_retranslate = false; files[fi].legacy_out = '';
       setChip(fi,'ok');
     }else{
       files[fi].error = res.error || '翻译失败';
@@ -1346,14 +1816,18 @@ async function poll(forceFull=false){
     d = await r.json();
   }catch(e){ pollBusy = false; return; }
   pollBusy = false;
-  if(d.status === 'notfound'){ clearInterval(pollTimer); jobId=null; localStorage.removeItem('bench_job'); render(); return; }
+  if(d.status === 'notfound'){
+    clearInterval(pollTimer); jobId=null; interrupting=false;
+    localStorage.removeItem('bench_job'); render(); return;
+  }
   updateTotalProgress(d.done, d.total);
   updateFileProgress(d.current_file_done, d.current_file_total);
   $('cur').textContent = d.current ? '正在翻译：' + d.current + ' …' : '';
   currentName = d.current || currentName;
-  $('btnTrack').disabled = !jobId || !currentName;
+  updateDetailControls();
   if(d.current && trackingProgress) focusCurrentProgress();
   applyPartials(d.partials);
+  applyCompletedPartials(d.completed_partials);
   const doneN = d.done_names || [];
   (d.names||[]).forEach((name) => {
     const fi = fileIdx(name); if(fi < 0) return;
@@ -1365,12 +1839,13 @@ async function poll(forceFull=false){
     const queuedRetries = files.filter(f => f.retry_queued && typeof f.content === 'string');
     clearInterval(pollTimer); lastJob = jobId; jobId = null;
     interrupted = (d.status === 'interrupted');
+    interrupting = false;
     localStorage.removeItem('bench_job'); localStorage.setItem('bench_lastjob', lastJob);
     applyResults(d.results);
     if(interrupted){
       files.forEach(f => {
         if(f.status === 'run'){
-          f.status='q'; f.live_out={}; f.legacy_out=''; f.error='';
+          f.status='q'; f.error='';
         }
       });
     }
@@ -1388,10 +1863,18 @@ async function poll(forceFull=false){
 function download(i){
   const f = files[i];
   if(f.content_out === null) return;
+  const output=f.output_name || outputName(f.name, readCfg().tgt);
+  if(f.output_name || BINARY_DOCUMENT_EXTENSIONS.includes(fileExtension(output))){
+    const a=document.createElement('a');
+    a.href='/api/output-file?name=' + encodeURIComponent(output);
+    a.download=output;
+    document.body.appendChild(a); a.click(); a.remove();
+    return;
+  }
   const blob = new Blob([f.content_out], {type:'text/markdown;charset=utf-8'});
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
-  a.download = f.output_name || outputName(f.name, readCfg().tgt);
+  a.download = output;
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(()=>URL.revokeObjectURL(a.href), 3000);
 }
@@ -1399,6 +1882,9 @@ function download(i){
 $('btnTest').addEventListener('click', ping);
 $('cfg_thinking').addEventListener('click', () => {
   setThinkingMode($('cfg_thinking').dataset.enabled!=='true');
+});
+$('cfg_context_mode').addEventListener('change', event => {
+  updateContextModeUI(event.target.value);
 });
 $('btnSave').addEventListener('click', () => {
   localStorage.setItem('bench_cfg', JSON.stringify(readCfg()));
@@ -1445,22 +1931,31 @@ async function reconnectJob(){
       let file = files.find(f => f.name === source.name);
       if(!file){
         file = {name:source.name, content:null, status:'q', error:'', content_out:null,
-          live_out:{}, legacy_out:'', output_name:null, target_language:null, priority:false, retry_queued:false};
+          live_out:{}, completed_lines:{}, resume_retranslate:false, legacy_out:'',
+          output_name:null, target_language:null, priority:false, retry_queued:false,
+          source_id:null, source_format:'text', source_sha256:null,
+          text_eol:'lf', text_bom:false};
         files.push(file);
       }
       if(typeof source.content === 'string') file.content = source.content;
+      file.source_id=source.source_id||file.source_id||null;
+      file.source_format=source.source_format||file.source_format||'text';
+      file.source_sha256=source.source_sha256||file.source_sha256||null;
+      file.text_eol=source.text_eol||file.text_eol||'lf';
+      file.text_bom=source.text_bom===undefined ? !!file.text_bom : !!source.text_bom;
     }
     currentName = d.current || '';
     $('cur').textContent = d.current ? '正在翻译：' + d.current + ' …' : '';
     updateTotalProgress(d.done, d.total);
     updateFileProgress(d.current_file_done, d.current_file_total);
-    applyPartials(d.partials); applyResults(d.results);
+    applyPartials(d.partials); applyCompletedPartials(d.completed_partials); applyResults(d.results);
     if(d.status === 'done' || d.status === 'interrupted'){
       interrupted = d.status === 'interrupted'; lastJob = jid; jobId = null;
+      interrupting = false;
       if(interrupted){
         files.forEach(f => {
           if(f.status === 'run'){
-            f.status='q'; f.live_out={}; f.legacy_out=''; f.error='';
+            f.status='q'; f.error='';
           }
         });
       }
@@ -1475,7 +1970,7 @@ async function reconnectJob(){
   }catch(e){}
 }
 async function init(){
-  restoreFiles();
+  await restoreFiles();
   lastJob = localStorage.getItem('bench_lastjob');
   await reconnectJob();
   await markOutputsDone();

@@ -8,6 +8,7 @@
   python app.py [port]        # 默认 9000
   浏览器打开 http://localhost:9000
 """
+import base64
 import io
 import hashlib
 import http.client
@@ -21,8 +22,21 @@ import time
 import uuid
 import threading
 import zipfile
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from document_formats import (
+    BINARY_EXTENSIONS,
+    DocumentFormatError,
+    binary_digest,
+    build_binary_output,
+    cache_binary_source,
+    delete_binary_source,
+    document_extension,
+    extract_binary_text,
+    is_binary_document,
+    load_binary_source,
+)
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -30,11 +44,40 @@ if hasattr(sys.stdout, "reconfigure"):
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 OUTPUTS_DIR = os.path.join(BASE_DIR, "outputs")
+OUTPUT_INDEX_PATH = os.path.join(BASE_DIR, ".translation-state.json")
+SOURCE_CACHE_DIR = os.path.join(BASE_DIR, ".translation-sources")
 
 JOBS = {}
 JOBS_LOCK = threading.Lock()
+OUTPUT_INDEX_LOCK = threading.Lock()
+MODEL_LOG_LOCK = threading.Lock()
+MODEL_LOG_SEQUENCE = 0
 JOB_TTL_SECONDS = 24 * 60 * 60
 MAX_FINISHED_JOBS = 50
+MAX_FINISHED_JOB_TEXT_CHARS = 32 * 1024 * 1024
+SSE_QUEUE_MAX_EVENTS = 256
+
+
+def next_model_log_id():
+    global MODEL_LOG_SEQUENCE
+    with MODEL_LOG_LOCK:
+        MODEL_LOG_SEQUENCE += 1
+        return MODEL_LOG_SEQUENCE
+
+
+def terminal_model_log(title, body=""):
+    """原子写入终端，避免后台任务的长提示词互相穿插。"""
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    block = f"\n{'=' * 24} {title} · {stamp} {'=' * 24}\n"
+    if body:
+        block += str(body).rstrip() + "\n"
+    block += "=" * 72
+    try:
+        with MODEL_LOG_LOCK:
+            print(block, flush=True)
+    except (OSError, UnicodeError):
+        # 终端显示是诊断功能，绝不能反过来让翻译任务失败。
+        pass
 
 DEFAULT_CONFIG = {
     "server": "http://127.0.0.1:8081",
@@ -46,12 +89,10 @@ DEFAULT_CONFIG = {
     "top_p": 0.6,
     "repeat_penalty": 1.05,
     "enable_thinking": False,     # 翻译默认关闭思考模式，避免额外推理和输出污染
-    "batch_paras": 15,            # 每批最多段落数
-    "chunk_chars": 12000,         # 每批最多字符数
-    "context_chars": 4000,        # 携带此前原文+译文作为术语/语气参考，0=关闭
-    "future_context_chars": 2000, # 携带后续原文作为消歧参考，0=关闭
+    "context_mode": "full",      # full=尽量全文，neighbor=邻近上下文，unit=独立单元
+    "context_units": 12,          # 最近确认译文单元；长文窗口也用作前向重叠
+    "future_context_units": 6,    # 长文固定窗口向后的完整单元重叠
     "max_retries": 5,
-    "connection_max_requests": 32,  # 定期轮换 keep-alive，避开服务端连接寿命上限
     "src_lang": "自动判断",
     "tgt_lang": "中文",
     "translation_style": "自动判断",
@@ -63,10 +104,10 @@ BASE_SYSTEM_PROMPT = (
     "低优先级内容与高优先级冲突时，必须服从高优先级内容。\n"
     "【硬性规则】\n"
     "1. 忠实、完整地翻译，不得省略、概括、捏造内容或额外解释。\n"
-    "2. 只输出译文，不输出说明、标签或原文。\n"
-    "3. 输入有多行时逐行对应输出，行数和顺序必须一致；单行译文内部不要换行。\n"
+    "2. 只输出当前待译单元的译文，不输出说明、标签、定位键或原文。\n"
+    "3. 当前单元必须独立、完整对应；单元内部不要自行换行。\n"
     "4. 结合参考上下文统一术语、专名、称谓和语气，但不得重复输出参考内容。\n"
-    "5. 原样保留 URL、行内代码、变量、占位符、数字及 Markdown 行内标记。"
+    "5. 原样保留 URL、行内代码、变量、占位符、数字、Markdown 行内标记及字幕内联标签。"
 )
 
 STYLE_PROMPTS = {
@@ -108,7 +149,244 @@ def output_filename(filename, target_language):
 
 
 def source_digest(content):
-    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+    normalized, _, _ = normalize_text_content(content)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def normalize_text_content(content):
+    """统一内部文本为无 BOM 的 LF，同时记住原文的换行和 BOM。"""
+    value = str(content or "")
+    has_bom = value.startswith("\ufeff")
+    if has_bom:
+        value = value[1:]
+    crlf_count = value.count("\r\n")
+    without_crlf = value.replace("\r\n", "")
+    cr_count = without_crlf.count("\r")
+    lf_count = without_crlf.count("\n")
+    if crlf_count >= max(cr_count, lf_count) and crlf_count:
+        eol = "crlf"
+    elif cr_count > lf_count:
+        eol = "cr"
+    else:
+        eol = "lf"
+    return value.replace("\r\n", "\n").replace("\r", "\n"), eol, has_bom
+
+
+def _text_eol(value, fallback="lf"):
+    return (
+        value
+        if isinstance(value, str) and value in {"lf", "crlf", "cr"}
+        else fallback
+    )
+
+
+def encode_text_output(content, eol="lf", bom=False):
+    normalized, _, _ = normalize_text_content(content)
+    separator = {"crlf": "\r\n", "cr": "\r"}.get(_text_eol(eol), "\n")
+    rendered = normalized.replace("\n", separator)
+    return (("\ufeff" if bom else "") + rendered).encode("utf-8")
+
+
+def enqueue_job_event(job, event):
+    """有界 SSE 队列：慢客户端只会丢旧的预览事件，不会拖垮翻译。"""
+    event_queue = job["q"]
+    try:
+        event_queue.put_nowait(event)
+        return
+    except queue.Full:
+        pass
+    try:
+        event_queue.get_nowait()
+    except queue.Empty:
+        pass
+    try:
+        event_queue.put_nowait(event)
+    except queue.Full:
+        # 并发消费时极少可能再次满；/status 仍可恢复真实状态。
+        pass
+
+
+def save_translation_output(file_info, translated_content, target_language):
+    """按源格式保存译文；二进制容器从缓存原文重建。"""
+    name = file_info["name"]
+    output_name = output_filename(name, target_language)
+    output_path = os.path.join(OUTPUTS_DIR, output_name)
+    source_format = str(file_info.get("source_format") or "text").lower()
+    source_content = file_info.get("content", "")
+    os.makedirs(OUTPUTS_DIR, exist_ok=True)
+    os.makedirs(SOURCE_CACHE_DIR, exist_ok=True)
+
+    extension = document_extension(name)
+    if extension in BINARY_EXTENSIONS and source_format != extension.lstrip("."):
+        raise DocumentFormatError("缺少二进制原文，请重新添加文件")
+    if is_binary_document(source_format) and extension != "." + source_format:
+        raise DocumentFormatError("文件扩展名与二进制原文格式不一致")
+    if is_binary_document(source_format):
+        source_data = load_binary_source(
+            SOURCE_CACHE_DIR,
+            file_info.get("source_id"),
+            source_format,
+            file_info.get("source_sha256", ""),
+        )
+        output_data = build_binary_output(
+            source_format, source_data, translated_content
+        )
+        digest = binary_digest(source_data)
+    else:
+        output_data = encode_text_output(
+            translated_content,
+            file_info.get("text_eol", "lf"),
+            bool(file_info.get("text_bom", False)),
+        )
+        digest = source_digest(source_content)
+
+    temporary = output_path + "." + uuid.uuid4().hex + ".tmp"
+    try:
+        with open(temporary, "wb") as handle:
+            handle.write(output_data)
+        os.replace(temporary, output_path)
+    finally:
+        try:
+            os.remove(temporary)
+        except OSError:
+            pass
+
+    metadata = {
+        "source_name": os.path.basename(str(name).replace("\\", "/")),
+        "source_sha256": digest,
+        "source_format": source_format,
+        "target_language": target_language,
+        "output_name": output_name,
+    }
+    save_output_metadata(metadata)
+    return output_name
+
+
+def read_output_preview(output_path, output_name):
+    extension = document_extension(output_name)
+    if extension in BINARY_EXTENSIONS:
+        with open(output_path, "rb") as handle:
+            return extract_binary_text(extension, handle.read())
+    with open(output_path, "rb") as handle:
+        content = handle.read().decode("utf-8-sig")
+    return normalize_text_content(content)[0]
+
+
+def _read_output_index():
+    try:
+        with open(OUTPUT_INDEX_PATH, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_output_index(index):
+    temp_path = OUTPUT_INDEX_PATH + ".tmp"
+    with open(temp_path, "w", encoding="utf-8") as fh:
+        json.dump(index, fh, ensure_ascii=False, indent=2)
+    os.replace(temp_path, OUTPUT_INDEX_PATH)
+
+
+def save_output_metadata(metadata):
+    """把所有译文状态集中保存在一个内部索引，不污染 outputs 目录。"""
+    output_name = metadata.get("output_name")
+    if not output_name or output_name != os.path.basename(output_name):
+        raise ValueError("无效的译文文件名")
+    with OUTPUT_INDEX_LOCK:
+        index = _read_output_index()
+        index[output_name] = dict(metadata)
+        _write_output_index(index)
+
+
+def remove_output_metadata(output_name):
+    with OUTPUT_INDEX_LOCK:
+        index = _read_output_index()
+        if index.pop(output_name, None) is not None:
+            _write_output_index(index)
+
+
+def migrate_legacy_metadata():
+    """一次性合并旧版逐文件 sidecar，然后移除这些程序生成的旧文件。"""
+    if not os.path.isdir(OUTPUTS_DIR):
+        return
+    legacy_paths = [
+        os.path.join(OUTPUTS_DIR, name)
+        for name in os.listdir(OUTPUTS_DIR)
+        if name.endswith(".meta.json")
+    ]
+    if not legacy_paths:
+        return
+    with OUTPUT_INDEX_LOCK:
+        index = _read_output_index()
+        for meta_path in legacy_paths:
+            try:
+                with open(meta_path, "r", encoding="utf-8") as fh:
+                    metadata = json.load(fh)
+                output_name = metadata.get("output_name")
+                if (
+                    isinstance(output_name, str)
+                    and output_name == os.path.basename(output_name)
+                    and os.path.isfile(os.path.join(OUTPUTS_DIR, output_name))
+                ):
+                    index[output_name] = metadata
+            except (OSError, ValueError, AttributeError):
+                continue
+        _write_output_index(index)
+    for meta_path in legacy_paths:
+        try:
+            os.remove(meta_path)
+        except OSError:
+            pass
+
+
+def prune_output_metadata():
+    """移除已经没有对应译文文件的状态项，避免索引无界增长。"""
+    with OUTPUT_INDEX_LOCK:
+        index = _read_output_index()
+        kept = {
+            name: metadata
+            for name, metadata in index.items()
+            if (
+                isinstance(name, str)
+                and name == os.path.basename(name)
+                and os.path.isfile(os.path.join(OUTPUTS_DIR, name))
+            )
+        }
+        if kept == index:
+            return 0
+        removed = len(index) - len(kept)
+        if kept:
+            _write_output_index(kept)
+        else:
+            try:
+                os.remove(OUTPUT_INDEX_PATH)
+            except FileNotFoundError:
+                pass
+        return removed
+
+
+def clear_output_cache():
+    """清除恢复状态和旧 sidecar；实际译文文件始终保留。"""
+    with OUTPUT_INDEX_LOCK:
+        cached = len(_read_output_index())
+        for path in (OUTPUT_INDEX_PATH, OUTPUT_INDEX_PATH + ".tmp"):
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+
+    legacy_removed = 0
+    if os.path.isdir(OUTPUTS_DIR):
+        for name in os.listdir(OUTPUTS_DIR):
+            if not name.endswith(".meta.json"):
+                continue
+            try:
+                os.remove(os.path.join(OUTPUTS_DIR, name))
+                legacy_removed += 1
+            except FileNotFoundError:
+                pass
+    return cached, legacy_removed
 
 
 def detect_lang(text):
@@ -176,8 +454,8 @@ class Translator:
         self.cfg = {**DEFAULT_CONFIG, **(config or {})}
         self._conn = None
         self._server = None
-        self._requests_on_connection = 0
         self._interrupt_event = threading.Event()
+        self._last_completion_error = None
 
     def _server_parts(self):
         if self._server is None:
@@ -204,7 +482,6 @@ class Translator:
                 self._conn.close()
             finally:
                 self._conn = None
-                self._requests_on_connection = 0
 
     @property
     def interrupted(self):
@@ -236,7 +513,7 @@ class Translator:
                 continue
             data = line[5:].strip()
             if data == "[DONE]":
-                # 继续由 HTTPResponse 读取完 chunked 终止块，保证连接可复用。
+                # 读完 chunked 终止块，再主动关闭本次本地连接。
                 resp.read()
                 break
             event = json.loads(data)
@@ -270,7 +547,9 @@ class Translator:
         headers = {
             "Content-Type": "application/json",
             "Content-Length": str(len(body)),
-            "Connection": "keep-alive",
+            # 当前 Windows llama-server 在流式响应结束后会关闭套接字。
+            # 明确一请求一连接，避免下一行先命中失效 keep-alive 再重试。
+            "Connection": "close",
         }
         api_key = str(self.cfg.get("api_key", "") or "").strip()
         if api_key:
@@ -298,10 +577,7 @@ class Translator:
                     content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
                     if content:
                         on_delta(content, content)
-            self._requests_on_connection += 1
-            max_requests = max(1, int(self.cfg.get("connection_max_requests", 32)))
-            if resp.will_close or self._requests_on_connection >= max_requests:
-                self.close()
+            self.close()
             return result
         except Exception:
             self.close()
@@ -332,85 +608,12 @@ class Translator:
         """为完整译文留出足够空间，也限制模型跑偏时的无限生成。"""
         return min(80000, max(256, int(self._estimate_tokens(text) * 1.5) + 256))
 
-    def _fits_whole_document(self, text, previous_translation=""):
-        """判断全文（以及重译时的旧译文）能否连同完整输出安全放入上下文。"""
-        estimated_input = (
-            self._estimate_tokens(self._system_prompt())
-            + self._estimate_tokens(text)
-            + (self._estimate_tokens(previous_translation) if previous_translation else 0)
-            + 512  # 用户提示、语言标签和聊天模板余量
-        )
-        estimated_total = estimated_input + self._output_token_budget(text) + 256
-        context_size = max(2048, int(self.cfg.get("context_size", 65536)))
-        return estimated_total <= int(context_size * 0.90)
-
-    def translate_text(
-        self, text, context_before="", context_after="",
-        previous_translation="", retranslate=False, on_stream=None,
-        preserve_line_markers=False,
+    def _complete_prompt(
+        self, prompt, max_tokens, on_stream=None, retry_on_length=True,
     ):
-        """翻译一段文本, 返回 (成功, 结果/错误)。"""
+        """发送一次聊天补全；传入的流回调接收当前累计文本。"""
         cfg = self.cfg
         sys_prompt = self._system_prompt()
-        est_in = sum(self._estimate_tokens(part) for part in (
-            text, context_before, context_after, previous_translation, sys_prompt
-        )) + 256
-        ctx = max(2048, int(cfg.get("context_size", 65536)))
-        # 输出约为输入量级; 限制 max_tokens 防止模型跑偏时无限生成导致卡死
-        available = ctx - est_in - 96
-        if available < 256:
-            return False, f"输入超出上下文预算（估算输入 {est_in} tokens，上下文 {ctx}）"
-        max_tokens = min(self._output_token_budget(text), available)
-        src = cfg.get("src_lang", "自动判断")
-        tgt = cfg.get("tgt_lang", "中文")
-        if src == "自动判断":
-            src = detect_lang(text)
-        marker_rule = (
-            "【行定位硬性规则】待译文本的每一行都以形如 [[L000001]] 的 ASCII 定位标记开头。"
-            "这些标记是不可修改的占位符，必须在对应译文开头原样输出，数量与顺序不得改变；"
-            "标记本身不得翻译，也不得输出任何额外标记。\n"
-            if preserve_line_markers else ""
-        )
-        if context_before or context_after or retranslate:
-            references = []
-            if context_before:
-                references.append(
-                    "【前文参考（原文及既有译文）】\n" + context_before
-                )
-            if context_after:
-                references.append(
-                    "【下文参考（尚未翻译的原文）】\n" + context_after
-                )
-            reference_text = "\n\n".join(references)
-            if retranslate:
-                previous_block = (
-                    f"\n\n【当前旧译文（仅供检查，不得盲目照抄）】\n{previous_translation}"
-                    if previous_translation else ""
-                )
-                prompt = (
-                    "这是重译校订任务。参考内容只用于理解语境、消除歧义并统一术语、称谓和语气。\n"
-                    "请对照原文检查旧译文中的错译、漏译、增译、称谓、术语、语气和不自然表达，"
-                    "然后完整地重新翻译当前文本。旧译文可能有错，只能作为纠错参考。\n"
-                    "只输出修正后的完整译文，不得输出分析、修改说明、原文、旧译文或前后文；"
-                    "输出行数和顺序必须与当前待译文本一致。\n\n"
-                    + marker_rule
-                    + (reference_text + "\n\n" if reference_text else "")
-                    + previous_block
-                    + f"\n\n【当前待译文本（{src} → {tgt}）】\n{text}"
-                )
-            else:
-                prompt = (
-                    "以下参考内容只用于理解语境、消除歧义并统一术语、称谓和语气。\n"
-                    "只翻译【当前待译文本】，不得翻译、续写或输出任何前文和下文参考。\n\n"
-                    + marker_rule
-                    + reference_text
-                    + f"\n\n【当前待译文本（{src} → {tgt}）】\n{text}"
-                )
-        else:
-            prompt = (
-                marker_rule
-                + f"将以下{src}文本翻译为{tgt}，注意只需要输出翻译后的结果，不要额外解释：\n\n{text}"
-            )
         payload = {
             "model": cfg["model"],
             "messages": ([{"role": "system", "content": sys_prompt}] if sys_prompt else [])
@@ -426,34 +629,63 @@ class Translator:
             "stream": bool(on_stream),
         }
         last = None
+        self._last_completion_error = None
         retryable = True
         attempts = max(1, int(cfg.get("max_retries", 5)))
 
-        def handle_stream_delta(_piece, accumulated):
-            if self._interrupt_event.is_set():
-                raise InterruptedError("任务已中断")
-            on_stream(accumulated)
-
         for attempt in range(attempts):
+            request_id = next_model_log_id()
+            terminal_model_log(
+                f"模型请求 #{request_id}（尝试 {attempt + 1}/{attempts}）",
+                "POST /v1/chat/completions\n"
+                + json.dumps(payload, ensure_ascii=False, indent=2),
+            )
+            response_accumulated = ""
+            response_logged = False
+
+            def handle_stream_delta(_piece, accumulated):
+                nonlocal response_accumulated
+                response_accumulated = accumulated
+                if self._interrupt_event.is_set():
+                    raise InterruptedError("任务已中断")
+                on_stream(accumulated)
+
             try:
                 if on_stream:
                     on_stream("")
-                r = self._post_json(
+                result = self._post_json(
                     payload,
                     handle_stream_delta if on_stream else None,
                 )
-                out = r["choices"][0]["message"]["content"]
-                if r["choices"][0].get("finish_reason") == "length":
+                choice = result["choices"][0]
+                output = choice["message"]["content"]
+                finish_reason = choice.get("finish_reason")
+                terminal_model_log(
+                    f"模型回复 #{request_id}（finish_reason={finish_reason or '未知'}）",
+                    output if output else "（模型返回空正文）",
+                )
+                response_logged = True
+                if choice.get("finish_reason") == "length" and retry_on_length:
                     raise RuntimeError("译文达到 max_tokens，输出被截断")
-                return True, out
-            except Exception as e:
-                last = e
+                return True, output
+            except Exception as exc:
+                last = exc
+                self._last_completion_error = exc
+                if not response_logged:
+                    terminal_model_log(
+                        f"模型回复 #{request_id}（请求未完成）",
+                        response_accumulated or "（未收到可用回复正文）",
+                    )
+                terminal_model_log(
+                    f"模型请求 #{request_id} 错误",
+                    f"{type(exc).__name__}: {exc}",
+                )
                 if self._interrupt_event.is_set():
                     return False, "任务已中断"
-                retryable = not isinstance(e, ModelServiceError) or e.transient
+                retryable = not isinstance(exc, ModelServiceError) or exc.transient
                 if not retryable or attempt + 1 >= attempts:
                     break
-                retry_after = getattr(e, "retry_after", None)
+                retry_after = getattr(exc, "retry_after", None)
                 delay = retry_after if retry_after is not None else min(20.0, 1.5 * (2 ** attempt))
                 self.close()
                 if self._interrupt_event.wait(delay):
@@ -461,216 +693,462 @@ class Translator:
         suffix = f"（已尝试 {attempts} 次）" if attempts > 1 and retryable else ""
         return False, str(last) + suffix
 
+    def translate_text(
+        self, text, context_before="", context_after="",
+        previous_translation="", retranslate=False, on_stream=None,
+        source_language=None, reference_text="", reference_kind="全文原文",
+    ):
+        """翻译一段文本, 返回 (成功, 结果/错误)。"""
+        cfg = self.cfg
+        sys_prompt = self._system_prompt()
+        est_in = sum(self._estimate_tokens(part) for part in (
+            text, context_before, context_after, previous_translation, sys_prompt,
+            reference_text,
+        )) + 384
+        ctx = max(2048, int(cfg.get("context_size", 65536)))
+        # 输出约为输入量级; 限制 max_tokens 防止模型跑偏时无限生成导致卡死
+        available = ctx - est_in - 96
+        if available < 256:
+            return False, f"输入超出上下文预算（估算输入 {est_in} tokens，上下文 {ctx}）"
+        max_tokens = min(self._output_token_budget(text), available)
+        src = source_language or cfg.get("src_lang", "自动判断")
+        tgt = cfg.get("tgt_lang", "中文")
+        if src == "自动判断":
+            src = detect_lang(text)
+        if reference_text or context_before or context_after or retranslate:
+            references = []
+            if reference_text:
+                references.append(
+                    f"【固定{reference_kind}（只供理解，禁止翻译或输出）】\n"
+                    + reference_text
+                    + f"\n【固定{reference_kind}结束】"
+                )
+            if context_before:
+                references.append(
+                    "【最近已确认译文（用于统一术语、称谓和语气）】\n"
+                    + context_before
+                )
+            if context_after:
+                references.append(
+                    "【邻近下文参考（尚未翻译的原文）】\n" + context_after
+                )
+            context_text = "\n\n".join(references)
+            if retranslate:
+                previous_block = (
+                    f"\n\n【当前旧译文（仅供检查，不得盲目照抄）】\n{previous_translation}"
+                    if previous_translation else ""
+                )
+                retranslation_instruction = (
+                    "请对照原文检查旧译文中的错译、漏译、增译、称谓、术语、语气和不自然表达，"
+                    "然后完整地重新翻译当前文本。旧译文可能有错，只能作为纠错参考。\n"
+                    if previous_translation else
+                    "请忽略旧版译文，基于原文和本轮已经确认的新译文，完整地重新翻译当前文本。\n"
+                )
+                prompt = (
+                    "这是重译任务。参考内容只用于理解语境、消除歧义并统一术语、称谓和语气。\n"
+                    + retranslation_instruction
+                    + "只输出修正后的完整译文，不得输出分析、修改说明、原文、旧译文或前后文；"
+                    "单段译文内部不要自行换行。\n\n"
+                    + (context_text + "\n\n" if context_text else "")
+                    + previous_block
+                    + f"\n\n【当前待译文本（{src} → {tgt}）】\n{text}"
+                )
+            else:
+                prompt = (
+                    "以下固定参考和已确认译文只用于理解语境、消除歧义并统一术语、称谓和语气。\n"
+                    "只翻译【当前待译文本】，不得翻译、续写或输出任何前文和下文参考。\n\n"
+                    + context_text
+                    + f"\n\n【当前待译文本（{src} → {tgt}）】\n{text}"
+                )
+        else:
+            prompt = (
+                "只翻译【当前待译文本】，只输出对应译文，不得输出说明、标签或原文；"
+                "单元内部不要自行换行。"
+                f"\n\n【当前待译文本（{src} → {tgt}）】\n{text}"
+            )
+        return self._complete_prompt(prompt, max_tokens, on_stream)
+
     @staticmethod
     def _one_line(text):
         """模型偶尔自行断行；压回一行以保持源文的行结构。"""
         return re.sub(r"\s*\r?\n+\s*", " ", str(text).strip())
 
-    def _context_text(self, history):
-        """从已完成的 (原文, 译文) 中截取最近的滑动参考窗口。"""
-        limit = max(0, int(self.cfg.get("context_chars", 4000)))
-        if not history or limit == 0:
+    def _context_token_caps(self):
+        """单元上下文最多使用约15%的模型窗口，前文占三分之二。"""
+        context_size = max(2048, int(self.cfg.get("context_size", 65536)))
+        total = max(256, min(8192, int(context_size * 0.15)))
+        before = max(128, int(total * 2 / 3))
+        return before, max(128, total - before)
+
+    def _document_reference_budget(self, sources):
+        """计算可分给固定全文/窗口参考的安全 token 预算。"""
+        context_size = max(2048, int(self.cfg.get("context_size", 65536)))
+        source_units = [
+            unit
+            for source in sources
+            for unit in self._semantic_units(source)
+            if unit.strip()
+        ]
+        if source_units:
+            largest_input = max(self._estimate_tokens(unit) for unit in source_units)
+            largest_output = max(self._output_token_budget(unit) for unit in source_units)
+        else:
+            largest_input = 1
+            largest_output = 256
+        recent_translation_budget, _ = self._context_token_caps()
+        fixed_prompt = self._estimate_tokens(self._system_prompt()) + 512
+        safety = max(256, min(4096, int(context_size * 0.06)))
+        return max(
+            0,
+            context_size
+            - fixed_prompt
+            - recent_translation_budget
+            - largest_input
+            - largest_output
+            - safety,
+        )
+
+    @staticmethod
+    def _is_reference_boundary(lines, translatable, position):
+        """判断某个待译单元之前是否适合作为稳定窗口边界。"""
+        if position <= 0 or position >= len(translatable):
+            return True
+        previous_line = translatable[position - 1][0]
+        current_line = translatable[position][0]
+        if current_line - previous_line > 1:
+            return True
+        current = lines[current_line]
+        return bool(re.match(r"^\s{0,3}#{1,6}[ \t]+", current))
+
+    @staticmethod
+    def _reference_excerpt(lines, translatable, start, end):
+        """按原文件顺序生成参考片段，并保留段落间的空行。"""
+        selected = translatable[start:end]
+        if not selected:
             return ""
+        parts = []
+        previous_line = None
+        for line_index, _ in selected:
+            if previous_line is not None and line_index - previous_line > 1:
+                parts.append("")
+            parts.append(lines[line_index])
+            previous_line = line_index
+        return "\n".join(parts).strip()
+
+    def _document_reference_plan(self, content, translatable, filename=""):
+        """选择可缓存的全文参考或稳定语义窗口。"""
+        if not translatable:
+            return []
+        sources = [text for _, text in translatable]
+        budget = self._document_reference_budget(sources)
+        if budget <= 0:
+            return [
+                {"text": "", "kind": "邻近原文参考", "window": 0}
+                for _ in sources
+            ]
+
+        lines = str(content).split("\n")
+        extension = os.path.splitext(str(filename))[1].lower()
+        full_reference = (
+            self._reference_excerpt(lines, translatable, 0, len(translatable))
+            if extension in {".srt", ".vtt"}
+            else str(content).strip()
+        )
+        if full_reference and self._estimate_tokens(full_reference) <= budget:
+            entry = {"text": full_reference, "kind": "全文原文参考", "window": 0}
+            return [entry] * len(translatable)
+
+        core_budget = max(128, int(budget * 0.68))
+        groups = []
+        start = 0
+        total = len(translatable)
+        while start < total:
+            end = start
+            used = 0
+            last_boundary = None
+            while end < total:
+                line_text = lines[translatable[end][0]]
+                cost = self._estimate_tokens(line_text) + 2
+                if end > start and used + cost > core_budget:
+                    break
+                used += cost
+                end += 1
+                if self._is_reference_boundary(lines, translatable, end):
+                    last_boundary = end
+            if end < total and last_boundary and last_boundary > start:
+                if last_boundary - start >= max(1, (end - start) // 3):
+                    end = last_boundary
+            if end <= start:
+                end = start + 1
+            groups.append((start, end))
+            start = end
+
+        previous_overlap = max(0, int(self.cfg.get("context_units", 12)))
+        future_overlap = max(0, int(self.cfg.get("future_context_units", 6)))
+        plan = [None] * total
+        for window_index, (core_start, core_end) in enumerate(groups):
+            group_start, group_end = core_start, core_end
+            left = max(0, core_start - previous_overlap)
+            right = min(total, core_end + future_overlap)
+            reference = self._reference_excerpt(lines, translatable, left, right)
+
+            while reference and self._estimate_tokens(reference) > budget:
+                if left < core_start:
+                    left += 1
+                elif right > core_end:
+                    right -= 1
+                elif core_end - core_start > 1:
+                    core_end -= 1
+                else:
+                    reference = ""
+                    break
+                reference = self._reference_excerpt(
+                    lines, translatable, left, right
+                )
+
+            entry = {
+                "text": reference,
+                "kind": "当前语义窗口参考",
+                "window": window_index,
+            }
+            for position in range(group_start, group_end):
+                plan[position] = entry
+
+        fallback = {"text": "", "kind": "邻近原文参考", "window": -1}
+        return [entry or fallback for entry in plan]
+
+    def _context_mode(self):
+        """返回有效上下文模式；旧配置和非法值均回退到默认模式。"""
+        mode = str(self.cfg.get("context_mode", "full")).strip().lower()
+        return mode if mode in {"full", "neighbor", "unit"} else "full"
+
+    def _active_reference_plan(self, content, translatable, filename=""):
+        """只有“尽量全文”模式才构建全文或固定语义窗口参考。"""
+        if self._context_mode() == "full":
+            return self._document_reference_plan(content, translatable, filename)
+        kind = (
+            "邻近原文参考"
+            if self._context_mode() == "neighbor"
+            else "独立单元"
+        )
+        return [
+            {"text": "", "kind": kind, "window": -1}
+            for _ in translatable
+        ]
+
+    def _semantic_units(self, text):
+        """只在超长物理行中按完整句末拆分；普通行原样作为一个单元。"""
+        text = str(text)
+        context_size = max(2048, int(self.cfg.get("context_size", 65536)))
+        max_tokens = max(256, min(2048, int(context_size * 0.05)))
+        if self._estimate_tokens(text) <= max_tokens:
+            return [text]
+
+        sentences = [
+            match.group(0)
+            for match in re.finditer(
+                r".+?(?:[。！？.!?]+[”’\"」』）)\]]*\s*|$)",
+                text,
+                re.DOTALL,
+            )
+            if match.group(0)
+        ]
+        if not sentences:
+            sentences = [text]
+
+        units, current = [], ""
+        for sentence in sentences:
+            candidate = current + sentence
+            if current and self._estimate_tokens(candidate) > max_tokens:
+                units.append(current.strip())
+                current = sentence
+            else:
+                current = candidate
+
+            # 极端情况下单句本身也可能超过预算；优先在空白处拆分，
+            # 找不到空白时才按估算比例硬切，避免请求直接超出上下文。
+            while self._estimate_tokens(current) > max_tokens:
+                approximate = max(1, int(len(current) * max_tokens / self._estimate_tokens(current)))
+                split_at = current.rfind(" ", max(1, approximate // 2), approximate + 1)
+                if split_at <= 0:
+                    split_at = approximate
+                units.append(current[:split_at].strip())
+                current = current[split_at:].lstrip()
+        if current.strip():
+            units.append(current.strip())
+        return units or [text]
+
+    def _join_translated_units(self, parts):
+        """子单元重新并回原物理行；中日韩目标语言不额外插入空格。"""
+        target = self.cfg.get("tgt_lang", "中文")
+        separator = "" if target in {"中文", "繁体中文", "粤语", "日文", "韩文"} else " "
+        return separator.join(part.strip() for part in parts if part.strip())
+
+    @staticmethod
+    def _plain_unit(line):
+        """保留纯文本行首尾空白，把中间正文作为可翻译内容。"""
+        plain = re.match(r"^(\s*)(.*?)([ \t]*)$", line)
+        prefix, text, suffix = plain.groups()
+        if not text:
+            return {"translate": False, "original": line}
+        return {"translate": True, "prefix": prefix, "text": text, "suffix": suffix}
+
+    @classmethod
+    def _subtitle_units(cls, content, extension):
+        """解析 SRT/WebVTT 物理行，锁住编号、时间轴和控制区块。"""
+        lines = normalize_text_content(content)[0].split("\n")
+        units = [cls._plain_unit(line) for line in lines]
+        timestamp = re.compile(
+            r"^\s*(?:\d{1,3}:)?\d{2}:\d{2}[,.]\d{3}\s+-->\s+"
+            r"(?:\d{1,3}:)?\d{2}:\d{2}[,.]\d{3}(?:\s+.*)?$"
+        )
+
+        def preserve(index):
+            units[index] = {"translate": False, "original": lines[index]}
+
+        if extension == ".vtt" and lines:
+            first = lines[0].lstrip("\ufeff").strip()
+            if first.startswith("WEBVTT"):
+                index = 0
+                while index < len(lines):
+                    preserve(index)
+                    if index > 0 and not lines[index].strip():
+                        break
+                    index += 1
+
+        block = False
+        for index, line in enumerate(lines):
+            stripped = line.strip()
+            if extension == ".vtt":
+                if re.match(r"^(?:NOTE(?:\s|$)|STYLE$|REGION$)", stripped):
+                    block = True
+                if block:
+                    preserve(index)
+                    if not stripped:
+                        block = False
+                    continue
+            if not stripped:
+                preserve(index)
+                continue
+            if timestamp.match(line):
+                preserve(index)
+                # SRT 在时间轴前只有数字序号；VTT 还允许任意 cue id。
+                if index > 0 and lines[index - 1].strip():
+                    previous = lines[index - 1].strip()
+                    if extension == ".vtt" or previous.isdigit():
+                        preserve(index - 1)
+        return units
+
+    @classmethod
+    def _document_units(cls, content, filename=""):
+        """按文件格式返回与物理行一一对应的翻译单元。"""
+        content = normalize_text_content(content)[0]
+        extension = os.path.splitext(str(filename))[1].lower()
+        if extension in {".srt", ".vtt"}:
+            return cls._subtitle_units(content, extension)
+        if extension in BINARY_EXTENSIONS:
+            return [cls._plain_unit(line) for line in content.split("\n")]
+        units = []
+        in_fence = False
+        for line in content.split("\n"):
+            unit, in_fence = cls._markdown_unit(line, in_fence)
+            units.append(unit)
+        return units
+
+    def _context_text(self, history):
+        """选择最近的完整 (原文, 译文) 单元，不从字符中间截断。"""
+        if self._context_mode() == "unit":
+            return ""
+        unit_limit = max(0, int(self.cfg.get("context_units", 12)))
+        if not history or unit_limit == 0:
+            return ""
+        token_limit, _ = self._context_token_caps()
         blocks = []
-        used = 0
-        for source, translated in reversed(history):
+        used_tokens = 0
+        for source, translated in reversed(history[-unit_limit:]):
             block = f"[原文]\n{source}\n[译文]\n{translated}"
-            extra = len(block) + (2 if blocks else 0)
-            if blocks and used + extra > limit:
+            block_tokens = self._estimate_tokens(block)
+            if used_tokens + block_tokens > token_limit:
                 break
-            if not blocks and len(block) > limit:
-                block = block[-limit:]
-                extra = len(block)
             blocks.append(block)
-            used += extra
+            used_tokens += block_tokens
         return "\n\n".join(reversed(blocks))
 
     def _future_context_text(self, sources):
-        """从当前批次之后的原文开头截取下文参考窗口。"""
-        limit = max(0, int(self.cfg.get("future_context_chars", 2000)))
-        if not sources or limit == 0:
+        """选择接下来的完整原文单元，不从句子中间截断。"""
+        if self._context_mode() == "unit":
             return ""
+        unit_limit = max(0, int(self.cfg.get("future_context_units", 6)))
+        if not sources or unit_limit == 0:
+            return ""
+        _, token_limit = self._context_token_caps()
         blocks = []
-        used = 0
+        used_tokens = 0
         for source in sources:
-            source = str(source).strip()
-            if not source:
-                continue
-            separator = 2 if blocks else 0
-            remaining = limit - used - separator
-            if remaining <= 0:
-                break
-            if len(source) > remaining:
-                source = source[:remaining]
-            blocks.append(source)
-            used += separator + len(source)
-            if used >= limit:
-                break
+            for unit in self._semantic_units(source):
+                unit = unit.strip()
+                if not unit:
+                    continue
+                unit_tokens = self._estimate_tokens(unit)
+                if len(blocks) >= unit_limit or used_tokens + unit_tokens > token_limit:
+                    return "\n\n".join(blocks)
+                blocks.append(unit)
+                used_tokens += unit_tokens
         return "\n\n".join(blocks)
 
     def translate_batch(
         self, paras, history=None, future=None, previous_translations=None,
-        preview=None,
+        preview=None, source_language=None, reference_text="",
+        reference_kind="全文原文参考",
     ):
-        """批翻译行；用定位标记稳定映射流式输出，异常时仅降级当前区段。"""
-        history = list(history or [])
+        """逐段翻译；每个模型请求只对应一个由程序确定的位置。"""
+        history = history if isinstance(history, list) else list(history or [])
         future = list(future or [])
         is_retranslation = previous_translations is not None
         previous_translations = list(previous_translations or [])
         if not paras:
             return True, []
-
-        use_markers = len(paras) > 1
-        markers = [f"[[L{pos + 1:06d}]]" for pos in range(len(paras))]
-        text = (
-            "\n".join(marker + para for marker, para in zip(markers, paras))
-            if use_markers else paras[0]
-        )
-        previous_text = (
-            "\n".join(
-                marker + translated
-                for marker, translated in zip(markers, previous_translations)
-            )
-            if use_markers else (previous_translations[0] if previous_translations else "")
-        )
-        preview_values = {}
-        # 小模型偶尔会把成对括号写反或漏掉一侧。真正用于定位的是 L 后的
-        # 六位序号，因此解析时宽容括号变形，避免余下全文被并入上一行。
-        marker_pattern = re.compile(
-            r"(?:(?:\[\[|\]\])|[⟦⟧])?\s*L(\d{6})\s*"
-            r"(?:(?:\[\[|\]\])|[⟦⟧])?"
-        )
-        partial_marker_pattern = re.compile(
-            r"\s*(?:(?:\[\[|\]\])|[⟦⟧])\s*L?\d{0,6}\s*$"
-        )
-
-        def set_preview(pos, value):
-            if not preview or pos < 0 or pos >= len(paras):
-                return
-            value = str(value or "")
-            if preview_values.get(pos) == value:
-                return
-            preview_values[pos] = value
-            preview(pos, value)
-
-        def parse_marked(value):
-            value = str(value or "")
-            matches = list(marker_pattern.finditer(value))
-            positions, lines = [], []
-            for match_pos, match in enumerate(matches):
-                end = matches[match_pos + 1].start() if match_pos + 1 < len(matches) else len(value)
-                positions.append(int(match.group(1)) - 1)
-                lines.append(self._one_line(value[match.end():end]))
-            return positions, lines
-
-        def stream_batch(accumulated):
-            if not accumulated:
-                return
-            if use_markers:
-                positions, lines = parse_marked(accumulated)
-                if lines:
-                    # SSE 可能刚好停在下一个标记的一半；不要把这段临时字符
-                    # 显示到上一行，等后续 token 到齐后再正常定位。
-                    lines[-1] = partial_marker_pattern.sub("", lines[-1])
-                for pos, line in zip(positions, lines):
-                    if 0 <= pos < len(paras) and line:
-                        set_preview(pos, line)
-            else:
-                line = self._one_line(accumulated)
-                if line:
-                    set_preview(0, line)
-
-        ok, out = self.translate_text(
-            text,
-            self._context_text(history),
-            self._future_context_text(future),
-            previous_text,
-            is_retranslation,
-            stream_batch if preview else None,
-            preserve_line_markers=use_markers,
-        )
-        if not ok:
-            return False, out
-
-        if use_markers:
-            positions, lines = parse_marked(out)
-            if (
-                positions == list(range(len(paras)))
-                and len(lines) == len(paras)
-                and all(lines)
-            ):
-                return True, lines
-        else:
-            translated = self._one_line(out)
-            if translated:
-                return True, [translated]
-
-        # 全文模式格式异常时，先缩小到正常批量大小。保留已经显示的临时译文，
-        # 子批次产生新 token 后只覆盖对应位置，不再清空整篇并从头闪回。
-        batch_size = max(1, int(self.cfg.get("batch_paras", 15)))
-        if len(paras) > batch_size:
-            res = []
-            sub_history = list(history)
-            for start in range(0, len(paras), batch_size):
-                end = min(len(paras), start + batch_size)
-                sub_previous = (
-                    previous_translations[start:end] if is_retranslation else None
-                )
-
-                def stream_sub(pos, value, offset=start):
-                    set_preview(offset + pos, value)
-
-                ok2, out2 = self.translate_batch(
-                    paras[start:end],
-                    sub_history,
-                    paras[end:] + future,
-                    sub_previous,
-                    stream_sub if preview else None,
-                )
-                if not ok2:
-                    return False, out2
-                res.extend(out2)
-                sub_history.extend(zip(paras[start:end], out2))
-            return True, res
-
-        # 小批次仍未遵守定位格式时才逐行重译。空的流事件不会抹掉已有预览。
         res = []
         for pos, p in enumerate(paras):
-            line_future = paras[pos + 1:] + future
+            source_units = self._semantic_units(p)
+            translated_units = []
+            for unit_pos, source_unit in enumerate(source_units):
+                unit_future = source_units[unit_pos + 1:] + paras[pos + 1:] + future
 
-            def stream_line(accumulated, current_pos=pos):
-                if accumulated:
-                    set_preview(current_pos, self._one_line(accumulated))
+                def stream_unit(accumulated, current_pos=pos):
+                    if accumulated and preview:
+                        preview(
+                            current_pos,
+                            self._join_translated_units(
+                                translated_units + [self._one_line(accumulated)]
+                            ),
+                        )
 
-            ok2, o2 = self.translate_text(
-                p,
-                self._context_text(history),
-                self._future_context_text(line_future),
-                previous_translations[pos] if pos < len(previous_translations) else "",
-                is_retranslation,
-                stream_line if preview else None,
-            )
-            if not ok2:
-                return False, o2
-            translated = self._one_line(o2)
-            res.append(translated)
-            history.append((p, translated))
+                previous = (
+                    previous_translations[pos]
+                    if len(source_units) == 1 and pos < len(previous_translations)
+                    else ""
+                )
+                ok2, o2 = self.translate_text(
+                    source_unit,
+                    self._context_text(history),
+                    "" if reference_text else self._future_context_text(unit_future),
+                    previous,
+                    is_retranslation,
+                    stream_unit if preview else None,
+                    source_language,
+                    reference_text,
+                    reference_kind,
+                )
+                if not ok2:
+                    return False, o2
+                translated_unit = self._one_line(o2)
+                if not translated_unit:
+                    return False, "模型返回了空译文"
+                translated_units.append(translated_unit)
+                history.append((source_unit, translated_unit))
+            res.append(self._join_translated_units(translated_units))
         return True, res
-
-    def _batches(self, items):
-        bp = max(1, int(self.cfg.get("batch_paras", 15)))
-        cc = max(256, int(self.cfg.get("chunk_chars", 12000)))
-        batches, cur, chars = [], [], 0
-        for item in items:
-            text = item[1]
-            if cur and (len(cur) >= bp or chars + len(text) + 2 > cc):
-                batches.append(cur)
-                cur, chars = [], 0
-            cur.append(item)
-            chars += len(text) + 2
-        if cur:
-            batches.append(cur)
-        return batches
 
     @staticmethod
     def _markdown_unit(line, in_fence):
@@ -723,9 +1201,11 @@ class Translator:
             text = text[:-len(suffix)]
         return text.strip()
 
-    def retranslate_line(self, content, translated_content, line_index):
+    def retranslate_line(self, content, translated_content, line_index, filename=""):
         """使用文件上下文重译一个物理行，返回 (新行, 更新后的完整译文)。"""
-        source_lines = str(content).split("\n")
+        content = normalize_text_content(content)[0]
+        translated_content = normalize_text_content(translated_content)[0]
+        source_lines = content.split("\n")
         try:
             line_index = int(line_index)
         except (TypeError, ValueError):
@@ -733,16 +1213,12 @@ class Translator:
         if line_index < 0 or line_index >= len(source_lines):
             raise ValueError("行号超出文件范围")
 
-        units = []
-        in_fence = False
-        for line in source_lines:
-            unit, in_fence = self._markdown_unit(line, in_fence)
-            units.append(unit)
+        units = self._document_units(content, filename)
         target = units[line_index]
         if not target.get("translate"):
             raise ValueError("该行是空行、代码或 Markdown 结构，不能单独重译")
 
-        translated_lines = str(translated_content).split("\n")
+        translated_lines = translated_content.split("\n")
         if len(translated_lines) < len(source_lines):
             translated_lines.extend(source_lines[len(translated_lines):])
 
@@ -762,8 +1238,26 @@ class Translator:
             self._translated_unit_text(target, translated_lines[line_index])
             if line_index < len(translated_lines) else ""
         )
+        translatable = [
+            (idx, unit["text"])
+            for idx, unit in enumerate(units)
+            if unit.get("translate")
+        ]
+        target_position = next(
+            pos for pos, (idx, _) in enumerate(translatable) if idx == line_index
+        )
+        reference = self._active_reference_plan(
+            content, translatable, filename
+        )[target_position]
         ok, translated = self.translate_batch(
-            [target["text"]], history, future, [previous_translation]
+            [target["text"]], history, future, [previous_translation],
+            source_language=(
+                detect_lang(content)
+                if self.cfg.get("src_lang", "自动判断") == "自动判断"
+                else self.cfg.get("src_lang")
+            ),
+            reference_text=reference["text"],
+            reference_kind=reference["kind"],
         )
         if not ok:
             return False, translated
@@ -774,93 +1268,104 @@ class Translator:
 
     def translate_content(
         self, content, filename="", emit=None, progress=None,
-        previous_content=None,
+        previous_content=None, resume_lines=None, checkpoint=None,
     ):
-        """翻译一段文件内容, 返回 (成功, 翻译后内容/错误)。
-        保留空行、标题层级、列表/引用前缀与代码块。emit(行号, 译文) 推送定位结果。"""
+        """翻译文件内容，逐个物理位置生成并保持 Markdown 结构。"""
+        content = normalize_text_content(content)[0]
         lines = content.split("\n")
         out = list(lines)
-        units = []
-        in_fence = False
-        for idx, line in enumerate(lines):
-            unit, in_fence = self._markdown_unit(line, in_fence)
-            units.append(unit)
+        units = self._document_units(content, filename)
+        for line_index, line in enumerate(lines):
+            unit = units[line_index]
             if not unit["translate"] and line.strip() and emit:
-                emit(idx, line)
+                emit(line_index, line)
 
-        translatable = [(idx, unit["text"]) for idx, unit in enumerate(units) if unit["translate"]]
-        completed_units = 0
-        if progress:
-            progress(0, len(translatable))
-        history = []
-        previous_lines = (
-            str(previous_content).split("\n") if previous_content is not None else []
+        translatable = [
+            (line_index, unit["text"])
+            for line_index, unit in enumerate(units)
+            if unit["translate"]
+        ]
+        configured_source = self.cfg.get("src_lang", "自动判断")
+        document_source = (
+            detect_lang("\n".join(text for _, text in translatable))
+            if configured_source == "自动判断" and translatable
+            else configured_source
         )
-        whole_sources = "\n\n".join(text for _, text in translatable)
-        whole_previous = ""
-        if previous_content is not None:
-            previous_bodies = []
-            for line_index, _ in translatable:
-                previous_line = (
-                    previous_lines[line_index]
-                    if line_index < len(previous_lines) else ""
-                )
-                previous_bodies.append(
-                    self._translated_unit_text(units[line_index], previous_line)
-                )
-            whole_previous = "\n\n".join(previous_bodies)
-        if translatable and self._fits_whole_document(whole_sources, whole_previous):
-            batches = [translatable]
-        else:
-            batches = self._batches(translatable)
-        for batch_pos, batch in enumerate(batches):
-            sources = [text for _, text in batch]
-            future_sources = [
-                text
-                for future_batch in batches[batch_pos + 1:]
-                for _, text in future_batch
+        reference_plan = self._active_reference_plan(content, translatable, filename)
+        resumed = {}
+        for raw_line, translated_line in (resume_lines or {}).items():
+            try:
+                line_index = int(raw_line)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(translated_line, str) and translated_line.strip():
+                resumed[line_index] = translated_line
+
+        total_units = len(translatable)
+        completed_units = 0
+        history = []
+        if progress:
+            progress(0, total_units)
+
+        for position, (line_index, source) in enumerate(translatable):
+            unit = units[line_index]
+            resumed_line = resumed.get(line_index)
+            if resumed_line is not None:
+                translated_body = self._translated_unit_text(unit, resumed_line)
+                if translated_body:
+                    out[line_index] = resumed_line
+                    history.append((source, translated_body))
+                    if emit:
+                        emit(line_index, resumed_line)
+                    if checkpoint:
+                        checkpoint(line_index, resumed_line)
+                    completed_units += 1
+                    if progress:
+                        progress(completed_units, total_units)
+                    continue
+
+            reference = reference_plan[position]
+            remaining_sources = [
+                text for _, text in translatable[position + 1:]
             ]
-            previous_batch = None
-            if previous_content is not None:
-                previous_batch = []
-                for line_index, _ in batch:
-                    previous_line = (
-                        previous_lines[line_index]
-                        if line_index < len(previous_lines) else ""
+
+            def preview_current(_position, text, current_line=line_index, current_unit=unit):
+                if emit:
+                    emit(
+                        current_line,
+                        current_unit["prefix"] + text + current_unit["suffix"]
+                        if text else "",
                     )
-                    previous_batch.append(
-                        self._translated_unit_text(units[line_index], previous_line)
-                    )
-            ok, trans = self.translate_batch(
-                sources,
-                history,
-                future_sources,
+
+            # 整个文件重译不把旧版译文喂回模型；previous_content 只用于
+            # 选择重译提示。单行重译仍由 retranslate_line() 提供旧译文。
+            previous_batch = [""] if previous_content is not None else None
+            ok, translated = self.translate_batch(
+                [source],
+                list(history),
+                remaining_sources,
                 previous_batch,
-                (
-                    lambda pos, text, current_batch=batch: emit(
-                        current_batch[pos][0],
-                        (
-                            units[current_batch[pos][0]]["prefix"]
-                            + text
-                            + units[current_batch[pos][0]]["suffix"]
-                        ) if text else "",
-                    )
-                    if emit else None
-                ),
+                preview_current,
+                document_source,
+                reference["text"],
+                reference["kind"],
             )
             if not ok:
-                return False, trans
-            for (idx, source), translated in zip(batch, trans):
-                unit = units[idx]
-                out[idx] = unit["prefix"] + translated + unit["suffix"]
-                history.append((source, translated))
-                if emit:
-                    emit(idx, out[idx])
-                completed_units += 1
-                if progress:
-                    progress(completed_units, len(translatable))
-        return True, "\n".join(out)
+                return False, translated
 
+            translated_body = translated[0]
+            output_line = unit["prefix"] + translated_body + unit["suffix"]
+            out[line_index] = output_line
+            history.append((source, translated_body))
+            if emit:
+                emit(line_index, output_line)
+            if checkpoint:
+                checkpoint(line_index, output_line)
+            completed_units += 1
+            if progress:
+                progress(completed_units, total_units)
+
+        return True, "\n".join(out)
 
 def run_job(job_id):
     """后台翻译任务，支持立即中断与优先级插队。"""
@@ -874,7 +1379,7 @@ def run_job(job_id):
     job["done_names"] = []
 
     def emit(kind, **kw):
-        job["q"].put({"kind": kind, **kw})
+        enqueue_job_event(job, {"kind": kind, **kw})
 
     pending = list(range(len(files)))   # 待处理顺序(原始索引)
     done = 0
@@ -909,6 +1414,12 @@ def run_job(job_id):
                     job["current_file_total"] = file_total
                 emit("file_progress", file=name, idx=idx, done=file_done, total=file_total)
 
+            def checkpoint_line(line_no, text):
+                with JOBS_LOCK:
+                    job["partials"].setdefault(name, {})[str(line_no)] = text
+                    job["completed_partials"].setdefault(name, {})[str(line_no)] = text
+                emit("line_done", file=name, idx=idx, line=line_no, text=text)
+
             try:
                 previous_content = (
                     files[idx].get("translated_content")
@@ -917,32 +1428,23 @@ def run_job(job_id):
                 ok, out = translator.translate_content(
                     content, name, emit=emit_line, progress=emit_file_progress,
                     previous_content=previous_content,
+                    resume_lines=files[idx].get("resume_lines"),
+                    checkpoint=checkpoint_line,
                 )
                 if job.get("interrupt") or translator.interrupted:
-                    with JOBS_LOCK:
-                        job["partials"].pop(name, None)
-                    emit("file_reset", file=name, idx=idx)
+                    # 中断只停止当前模型请求；已流式显示的内容继续保留，
+                    # 便于用户检查中断前的结果，不再重置整个文件预览。
                     break
                 if not ok:
                     job["results"].append({"name": name, "status": "error", "error": out})
                     emit("fail", file=name, msg=out)
                 else:
                     target = cfg.get("tgt_lang", "中文")
-                    out_name = output_filename(name, target)
-                    os.makedirs(OUTPUTS_DIR, exist_ok=True)
-                    with open(os.path.join(OUTPUTS_DIR, out_name), "w", encoding="utf-8") as fh:
-                        fh.write(out)
-                    metadata = {
-                        "source_name": name,
-                        "source_sha256": source_digest(content),
-                        "target_language": target,
-                        "output_name": out_name,
-                    }
-                    with open(os.path.join(OUTPUTS_DIR, out_name + ".meta.json"), "w", encoding="utf-8") as fh:
-                        json.dump(metadata, fh, ensure_ascii=False, indent=2)
+                    out_name = save_translation_output(files[idx], out, target)
                     job["results"].append({
                         "name": name, "output_name": out_name,
                         "target_language": target, "status": "ok", "content": out,
+                        "source_format": files[idx].get("source_format", "text"),
                     })
                     job["done_names"].append(name)
                     emit(
@@ -950,11 +1452,12 @@ def run_job(job_id):
                         done=job.get("current_file_total", 0),
                         total=job.get("current_file_total", 0),
                     )
+                    with JOBS_LOCK:
+                        # 成功文件已经有完整 result，无需再在内存中保存逐行副本。
+                        job["completed_partials"].pop(name, None)
             except Exception as e:
                 if job.get("interrupt") or translator.interrupted:
-                    with JOBS_LOCK:
-                        job["partials"].pop(name, None)
-                    emit("file_reset", file=name, idx=idx)
+                    # socket 被 interrupt() 主动关闭时也保留现有预览。
                     break
                 job["results"].append({"name": name, "status": "error", "error": str(e)})
                 emit("fail", file=name, msg=str(e))
@@ -967,6 +1470,9 @@ def run_job(job_id):
         translator.close()
         with JOBS_LOCK:
             job.pop("translator", None)
+            for file_info in job.get("files", []):
+                file_info.pop("translated_content", None)
+                file_info.pop("resume_lines", None)
 
     job["current"] = ""
     job["finished_at"] = time.time()
@@ -995,9 +1501,93 @@ def prune_jobs():
             key=lambda pair: pair[1].get("finished_at", pair[1].get("created_at", 0)),
             reverse=True,
         )
-        remove.update(jid for jid, _ in survivors[MAX_FINISHED_JOBS:])
+        retained_chars = 0
+        retained_count = 0
+        for jid, job in survivors:
+            text_chars = _job_text_chars(job)
+            exceeds_count = retained_count >= MAX_FINISHED_JOBS
+            exceeds_size = (
+                retained_count > 0
+                and retained_chars + text_chars > MAX_FINISHED_JOB_TEXT_CHARS
+            )
+            if exceeds_count or exceeds_size:
+                remove.add(jid)
+                continue
+            retained_count += 1
+            retained_chars += text_chars
         for jid in remove:
             JOBS.pop(jid, None)
+
+
+def _job_text_chars(value):
+    """估算任务中保留的字符量，避免已完成大任务无界占内存。"""
+    if isinstance(value, str):
+        return len(value)
+    if isinstance(value, dict):
+        return sum(_job_text_chars(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return sum(_job_text_chars(item) for item in value)
+    return 0
+
+
+def job_status_snapshot(job_id, requested_full=False):
+    """在锁内只复制内存状态；JSON 序列化和网络发送留到锁外。"""
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            return None
+        snapshot = {
+            key: job.get(key)
+            for key in (
+                "status",
+                "total",
+                "done",
+                "current",
+                "error",
+                "current_file_done",
+                "current_file_total",
+            )
+        }
+        full = requested_full or job.get("status") != "running"
+        if full:
+            snapshot["results"] = [dict(result) for result in job.get("results", [])]
+        else:
+            snapshot["results"] = [
+                {
+                    key: result.get(key)
+                    for key in (
+                        "name",
+                        "status",
+                        "error",
+                        "output_name",
+                        "target_language",
+                    )
+                }
+                for result in job.get("results", [])
+            ]
+        snapshot["names"] = [item["name"] for item in job.get("files", [])]
+        if requested_full:
+            snapshot["sources"] = [
+                {
+                    "name": item["name"],
+                    "content": item.get("content", ""),
+                    "source_id": item.get("source_id"),
+                    "source_format": item.get("source_format", "text"),
+                    "source_sha256": item.get("source_sha256"),
+                    "text_eol": item.get("text_eol", "lf"),
+                    "text_bom": bool(item.get("text_bom", False)),
+                }
+                for item in job.get("files", [])
+            ]
+        snapshot["done_names"] = list(job.get("done_names", []))
+        snapshot["partials"] = {
+            name: dict(lines) for name, lines in job.get("partials", {}).items()
+        }
+        snapshot["completed_partials"] = {
+            name: dict(lines)
+            for name, lines in job.get("completed_partials", {}).items()
+        }
+    return snapshot
 
 
 # ---------------------------------------------------------------------------
@@ -1043,60 +1633,51 @@ class Handler(BaseHTTPRequestHandler):
             self._serve_file(os.path.join(STATIC_DIR, "index.html"))
         elif path == "/api/status":
             job = query.get("job", [""])[0]
-            with JOBS_LOCK:
-                j = JOBS.get(job)
-                if not j:
-                    self._send_json({"status": "notfound"})
-                    return
-                base = {k: j.get(k) for k in
-                        ("status", "total", "done", "current", "error",
-                         "current_file_done", "current_file_total")}
-                requested_full = query.get("full", [""])[0] == "1"
-                full = requested_full or j.get("status") != "running"
-                if full:
-                    base["results"] = list(j.get("results", []))
-                else:
-                    base["results"] = [
-                        {k: result.get(k) for k in
-                         ("name", "status", "error", "output_name", "target_language")}
-                        for result in j.get("results", [])
-                    ]
-                base["names"] = [f["name"] for f in j.get("files", [])]
-                # 仅在显式完整恢复时返回原文，供刷新、跨浏览器或接口提交的任务
-                # 重建对照视图。普通状态轮询不携带正文，避免重复传输大文本。
-                if requested_full:
-                    base["sources"] = [
-                        {"name": f["name"], "content": f.get("content", "")}
-                        for f in j.get("files", [])
-                    ]
-                base["done_names"] = j.get("done_names", [])
-                base["partials"] = {
-                    name: dict(lines) for name, lines in j.get("partials", {}).items()
-                }
-                self._send_json(base)
+            base = job_status_snapshot(
+                job, requested_full=query.get("full", [""])[0] == "1"
+            )
+            if base is None:
+                self._send_json({"status": "notfound"})
+                return
+            self._send_json(base)
         elif path == "/api/running":
             with JOBS_LOCK:
                 running = [jid for jid, j in JOBS.items() if j.get("status") == "running"]
             self._send_json({"job": running[0] if running else None})
+        elif path == "/api/source":
+            source_id = query.get("id", [""])[0]
+            source_format = query.get("format", [""])[0]
+            source_sha256 = query.get("sha256", [""])[0]
+            try:
+                data = load_binary_source(
+                    SOURCE_CACHE_DIR, source_id, source_format, source_sha256
+                )
+                content = extract_binary_text(source_format, data)
+            except (DocumentFormatError, OSError) as exc:
+                self._send_json({"error": str(exc)}, 404)
+                return
+            self._send_json({
+                "ok": True,
+                "content": content,
+                "source_format": source_format,
+                "source_sha256": binary_digest(data),
+            })
         elif path == "/api/history":
             files_list = []
+            with OUTPUT_INDEX_LOCK:
+                output_index = _read_output_index()
             if os.path.isdir(OUTPUTS_DIR):
                 for fn in sorted(os.listdir(OUTPUTS_DIR)):
-                    if fn.lower().endswith((".md", ".markdown", ".txt", ".text")):
+                    if fn.lower().endswith((".md", ".markdown", ".txt", ".text", ".srt", ".vtt", ".docx", ".epub")):
                         p = os.path.join(OUTPUTS_DIR, fn)
                         entry = {"name": fn, "size": os.path.getsize(p)}
-                        meta_path = p + ".meta.json"
-                        if os.path.isfile(meta_path):
-                            try:
-                                with open(meta_path, "r", encoding="utf-8") as fh:
-                                    meta = json.load(fh)
-                                entry.update({
-                                    "source_name": meta.get("source_name"),
-                                    "source_sha256": meta.get("source_sha256"),
-                                    "target_language": meta.get("target_language"),
-                                })
-                            except (OSError, ValueError):
-                                pass
+                        meta = output_index.get(fn, {})
+                        entry.update({
+                            "source_name": meta.get("source_name"),
+                            "source_sha256": meta.get("source_sha256"),
+                            "source_format": meta.get("source_format", "text"),
+                            "target_language": meta.get("target_language"),
+                        })
                         files_list.append(entry)
             self._send_json({"files": files_list})
         elif path == "/api/output":
@@ -1108,8 +1689,50 @@ class Handler(BaseHTTPRequestHandler):
             if not os.path.isfile(output_path):
                 self._send_json({"error": "not found"}, 404)
                 return
-            with open(output_path, "r", encoding="utf-8") as fh:
-                self._send_json({"name": name, "content": fh.read()})
+            try:
+                content = read_output_preview(output_path, name)
+            except (OSError, DocumentFormatError) as exc:
+                self._send_json({"error": f"读取译文失败: {exc}"}, 500)
+                return
+            self._send_json({
+                "name": name,
+                "content": content,
+                "source_format": document_extension(name).lstrip(".") or "text",
+            })
+        elif path == "/api/output-file":
+            name = query.get("name", [""])[0]
+            if not name or name != os.path.basename(name) or name.endswith(".meta.json"):
+                self._send_json({"error": "invalid output name"}, 400)
+                return
+            output_path = os.path.join(OUTPUTS_DIR, name)
+            if not os.path.isfile(output_path):
+                self._send_json({"error": "not found"}, 404)
+                return
+            try:
+                with open(output_path, "rb") as handle:
+                    data = handle.read()
+            except OSError as exc:
+                self._send_json({"error": f"读取译文失败: {exc}"}, 500)
+                return
+            content_types = {
+                ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                ".epub": "application/epub+zip",
+                ".srt": "application/x-subrip; charset=utf-8",
+                ".vtt": "text/vtt; charset=utf-8",
+            }
+            self.send_response(200)
+            self.send_header(
+                "Content-Type",
+                content_types.get(document_extension(name), "application/octet-stream"),
+            )
+            self.send_header(
+                "Content-Disposition",
+                "attachment; filename*=UTF-8''" + quote(name, safe=""),
+            )
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
         elif path == "/api/test":
             server = query.get("server", [""])[0]
             ok, msg = test_server(server)
@@ -1165,12 +1788,14 @@ class Handler(BaseHTTPRequestHandler):
             with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
                 for r in j.get("results", []):
                     if r.get("status") == "ok":
-                        z.writestr(
-                            r.get("output_name") or output_filename(
-                                r["name"], j.get("config", {}).get("tgt_lang", "中文")
-                            ),
-                            r["content"],
+                        output_name = r.get("output_name") or output_filename(
+                            r["name"], j.get("config", {}).get("tgt_lang", "中文")
                         )
+                        output_path = os.path.join(OUTPUTS_DIR, output_name)
+                        if os.path.isfile(output_path):
+                            z.write(output_path, output_name)
+                        else:
+                            z.writestr(output_name, r["content"])
             data = buf.getvalue()
             self.send_response(200)
             self.send_header("Content-Type", "application/zip")
@@ -1184,6 +1809,35 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         path, query = self._request_parts()
+        if path == "/api/source":
+            source_id = query.get("id", [""])[0]
+            try:
+                deleted = delete_binary_source(SOURCE_CACHE_DIR, source_id)
+            except DocumentFormatError as exc:
+                self._send_json({"error": str(exc)}, 400)
+                return
+            self._send_json({"ok": True, "deleted": deleted})
+            return
+        if path == "/api/cache":
+            try:
+                cached, legacy = clear_output_cache()
+            except OSError as exc:
+                self._send_json({"error": f"清除缓存失败: {exc}"}, 500)
+                return
+            with JOBS_LOCK:
+                finished = [
+                    job_id for job_id, job in JOBS.items()
+                    if job.get("status") != "running"
+                ]
+                for job_id in finished:
+                    JOBS.pop(job_id, None)
+            self._send_json({
+                "ok": True,
+                "records": cached,
+                "legacy_files": legacy,
+                "finished_jobs": len(finished),
+            })
+            return
         if path != "/api/output":
             self._send_json({"error": "not found"}, 404)
             return
@@ -1200,6 +1854,7 @@ class Handler(BaseHTTPRequestHandler):
                 if os.path.isfile(candidate):
                     os.remove(candidate)
                     deleted.append(os.path.basename(candidate))
+            remove_output_metadata(name)
         except OSError as exc:
             self._send_json({"error": f"删除输出失败: {exc}"}, 500)
             return
@@ -1229,16 +1884,40 @@ class Handler(BaseHTTPRequestHandler):
             data = fh.read()
         self.send_response(200)
         self.send_header("Content-Type", MIME.get(ext, "application/octet-stream"))
+        if ext in (".html", ".css", ".js"):
+            self.send_header("Cache-Control", "no-cache")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
 
     def do_POST(self):
         path = self.path.split("?")[0]
+        if path == "/api/import":
+            try:
+                body = self._read_body()
+                if not isinstance(body, dict):
+                    raise DocumentFormatError("导入请求无效")
+                name = body.get("name", "")
+                encoded = body.get("data_base64", "")
+                if not isinstance(name, str) or not name or not isinstance(encoded, str):
+                    raise DocumentFormatError("导入请求无效")
+                try:
+                    data = base64.b64decode(encoded, validate=True)
+                except (ValueError, TypeError) as exc:
+                    raise DocumentFormatError("文档数据不是有效的 Base64") from exc
+                imported = cache_binary_source(SOURCE_CACHE_DIR, name, data)
+            except (DocumentFormatError, OSError, ValueError, UnicodeError) as exc:
+                self._send_json({"error": str(exc)}, 400)
+                return
+            self._send_json({"ok": True, "name": name, **imported})
+            return
         if path == "/api/update-line":
             try:
                 body = self._read_body()
             except Exception:
+                self._send_json({"error": "bad json"}, 400)
+                return
+            if not isinstance(body, dict):
                 self._send_json({"error": "bad json"}, 400)
                 return
             cfg = body.get("config", {})
@@ -1246,6 +1925,9 @@ class Handler(BaseHTTPRequestHandler):
             content = body.get("content")
             translated_content = body.get("translated_content")
             edited_text = body.get("text")
+            source_id = body.get("source_id")
+            source_format = body.get("source_format", "text")
+            source_sha256 = body.get("source_sha256", "")
             try:
                 line_index = int(body.get("line"))
             except (TypeError, ValueError):
@@ -1257,15 +1939,16 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"error": "invalid line update request"}, 400)
                 return
 
+            content, detected_eol, detected_bom = normalize_text_content(content)
+            translated_content = normalize_text_content(translated_content)[0]
+            text_eol = _text_eol(body.get("text_eol"), detected_eol)
+            text_bom = bool(body.get("text_bom", detected_bom))
+
             source_lines = content.split("\n")
             if line_index < 0 or line_index >= len(source_lines):
                 self._send_json({"error": "行号超出文件范围"}, 400)
                 return
-            units = []
-            in_fence = False
-            for source_line in source_lines:
-                unit, in_fence = Translator._markdown_unit(source_line, in_fence)
-                units.append(unit)
+            units = Translator._document_units(content, name)
             unit = units[line_index]
             if not unit.get("translate"):
                 self._send_json({"error": "该行不能编辑译文"}, 400)
@@ -1279,20 +1962,17 @@ class Handler(BaseHTTPRequestHandler):
             translated_lines[line_index] = output_line
             updated_content = "\n".join(translated_lines)
             target = cfg.get("tgt_lang", "中文")
-            out_name = output_filename(name, target)
-            os.makedirs(OUTPUTS_DIR, exist_ok=True)
             try:
-                with open(os.path.join(OUTPUTS_DIR, out_name), "w", encoding="utf-8") as fh:
-                    fh.write(updated_content)
-                metadata = {
-                    "source_name": os.path.basename(name.replace("\\", "/")),
-                    "source_sha256": source_digest(content),
-                    "target_language": target,
-                    "output_name": out_name,
-                }
-                with open(os.path.join(OUTPUTS_DIR, out_name + ".meta.json"), "w", encoding="utf-8") as fh:
-                    json.dump(metadata, fh, ensure_ascii=False, indent=2)
-            except OSError as exc:
+                out_name = save_translation_output({
+                    "name": name,
+                    "content": content,
+                    "source_id": source_id,
+                    "source_format": source_format,
+                    "source_sha256": source_sha256,
+                    "text_eol": text_eol,
+                    "text_bom": text_bom,
+                }, updated_content, target)
+            except (OSError, DocumentFormatError) as exc:
                 self._send_json({"error": f"保存编辑失败: {exc}"}, 500)
                 return
 
@@ -1314,20 +1994,31 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 self._send_json({"error": "bad json"}, 400)
                 return
+            if not isinstance(body, dict):
+                self._send_json({"error": "bad json"}, 400)
+                return
             cfg = body.get("config", {})
             name = body.get("name", "")
             content = body.get("content")
             translated_content = body.get("translated_content")
             line_index = body.get("line")
+            source_id = body.get("source_id")
+            source_format = body.get("source_format", "text")
+            source_sha256 = body.get("source_sha256", "")
             if (not isinstance(cfg, dict) or not isinstance(name, str) or not name
                     or not isinstance(content, str) or not isinstance(translated_content, str)):
                 self._send_json({"error": "invalid retranslation request"}, 400)
                 return
 
+            content, detected_eol, detected_bom = normalize_text_content(content)
+            translated_content = normalize_text_content(translated_content)[0]
+            text_eol = _text_eol(body.get("text_eol"), detected_eol)
+            text_bom = bool(body.get("text_bom", detected_bom))
+
             translator = Translator(cfg)
             try:
                 ok, result = translator.retranslate_line(
-                    content, translated_content, line_index
+                    content, translated_content, line_index, name
                 )
             except ValueError as exc:
                 self._send_json({"error": str(exc)}, 400)
@@ -1340,20 +2031,17 @@ class Handler(BaseHTTPRequestHandler):
 
             output_line, updated_content = result
             target = cfg.get("tgt_lang", "中文")
-            out_name = output_filename(name, target)
-            os.makedirs(OUTPUTS_DIR, exist_ok=True)
             try:
-                with open(os.path.join(OUTPUTS_DIR, out_name), "w", encoding="utf-8") as fh:
-                    fh.write(updated_content)
-                metadata = {
-                    "source_name": os.path.basename(name.replace("\\", "/")),
-                    "source_sha256": source_digest(content),
-                    "target_language": target,
-                    "output_name": out_name,
-                }
-                with open(os.path.join(OUTPUTS_DIR, out_name + ".meta.json"), "w", encoding="utf-8") as fh:
-                    json.dump(metadata, fh, ensure_ascii=False, indent=2)
-            except OSError as exc:
+                out_name = save_translation_output({
+                    "name": name,
+                    "content": content,
+                    "source_id": source_id,
+                    "source_format": source_format,
+                    "source_sha256": source_sha256,
+                    "text_eol": text_eol,
+                    "text_bom": text_bom,
+                }, updated_content, target)
+            except (OSError, DocumentFormatError) as exc:
                 self._send_json({"error": f"保存重译结果失败: {exc}"}, 500)
                 return
 
@@ -1374,6 +2062,8 @@ class Handler(BaseHTTPRequestHandler):
                 body = self._read_body()
             except Exception:
                 body = {}
+            if not isinstance(body, dict):
+                body = {}
             jid = body.get("job") or self.path.split("job=")[-1].split("&")[0]
             with JOBS_LOCK:
                 j = JOBS.get(jid)
@@ -1391,6 +2081,8 @@ class Handler(BaseHTTPRequestHandler):
                 body = self._read_body()
             except Exception:
                 body = {}
+            if not isinstance(body, dict):
+                body = {}
             jid = body.get("job")
             with JOBS_LOCK:
                 j = JOBS.get(jid)
@@ -1406,6 +2098,9 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             self._send_json({"error": "bad json"}, 400)
             return
+        if not isinstance(body, dict):
+            self._send_json({"error": "bad json"}, 400)
+            return
         cfg = body.get("config", {})
         files = body.get("files", [])
         if not isinstance(cfg, dict):
@@ -1418,6 +2113,17 @@ class Handler(BaseHTTPRequestHandler):
                    and isinstance(f.get("content", ""), str) for f in files):
             self._send_json({"error": "invalid files"}, 400)
             return
+        names = [file_info["name"] for file_info in files]
+        if any(
+            not name
+            or name != os.path.basename(name.replace("\\", "/"))
+            for name in names
+        ):
+            self._send_json({"error": "invalid file name"}, 400)
+            return
+        if len({name.casefold() for name in names}) != len(names):
+            self._send_json({"error": "同一任务中不能包含同名文件"}, 400)
+            return
         if not all(
             not f.get("retranslate")
             or isinstance(f.get("translated_content"), str)
@@ -1425,17 +2131,70 @@ class Handler(BaseHTTPRequestHandler):
         ):
             self._send_json({"error": "invalid retranslation files"}, 400)
             return
+        if not all(
+            f.get("resume_lines") is None
+            or (
+                isinstance(f.get("resume_lines"), dict)
+                and all(isinstance(value, str) for value in f["resume_lines"].values())
+            )
+            for f in files
+        ):
+            self._send_json({"error": "invalid resume lines"}, 400)
+            return
+        try:
+            for file_info in files:
+                extension = document_extension(file_info["name"])
+                source_format = str(file_info.get("source_format") or "text").lower()
+                if extension in BINARY_EXTENSIONS:
+                    if source_format != extension.lstrip("."):
+                        raise DocumentFormatError(
+                            f"{file_info['name']} 缺少二进制原文，请重新添加文件"
+                        )
+                    load_binary_source(
+                        SOURCE_CACHE_DIR,
+                        file_info.get("source_id"),
+                        source_format,
+                        file_info.get("source_sha256", ""),
+                    )
+                elif is_binary_document(source_format):
+                    raise DocumentFormatError("文件扩展名与二进制原文格式不一致")
+                else:
+                    content, detected_eol, detected_bom = normalize_text_content(
+                        file_info.get("content", "")
+                    )
+                    file_info["content"] = content
+                    file_info["text_eol"] = _text_eol(
+                        file_info.get("text_eol"), detected_eol
+                    )
+                    file_info["text_bom"] = bool(
+                        file_info.get("text_bom", detected_bom)
+                    )
+                    if isinstance(file_info.get("translated_content"), str):
+                        file_info["translated_content"] = normalize_text_content(
+                            file_info["translated_content"]
+                        )[0]
+        except DocumentFormatError as exc:
+            self._send_json({"error": str(exc)}, 400)
+            return
         prune_jobs()
         job_id = uuid.uuid4().hex[:12]
+        conflict = False
         with JOBS_LOCK:
-            JOBS[job_id] = {
-                "status": "running", "total": len(files), "done": 0,
-                "current": "", "results": [], "config": cfg, "files": files,
-                "current_file_done": 0, "current_file_total": 0,
-                "q": queue.Queue(), "interrupt": False,
-                "priority": list(body.get("priority", [])), "done_names": [],
-                "partials": {}, "created_at": time.time(),
-            }
+            conflict = any(
+                existing.get("status") == "running" for existing in JOBS.values()
+            )
+            if not conflict:
+                JOBS[job_id] = {
+                    "status": "running", "total": len(files), "done": 0,
+                    "current": "", "results": [], "config": cfg, "files": files,
+                    "current_file_done": 0, "current_file_total": 0,
+                    "q": queue.Queue(maxsize=SSE_QUEUE_MAX_EVENTS), "interrupt": False,
+                    "priority": list(body.get("priority", [])), "done_names": [],
+                    "partials": {}, "completed_partials": {}, "created_at": time.time(),
+                }
+        if conflict:
+            self._send_json({"error": "已有翻译任务正在运行，请先中断或等待完成"}, 409)
+            return
         threading.Thread(target=run_job, args=(job_id,), daemon=True).start()
         self._send_json({"job": job_id})
 
@@ -1465,6 +2224,8 @@ def main():
     if len(sys.argv) > 1:
         port = int(sys.argv[1])
     os.makedirs(OUTPUTS_DIR, exist_ok=True)
+    migrate_legacy_metadata()
+    prune_output_metadata()
     srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     print(f"翻译工作台: http://localhost:{port}")
     print(f"输出目录: {OUTPUTS_DIR}")

@@ -1,0 +1,12 @@
+WEBVTT - Translation Workbench Example
+Language: en
+
+opening
+00:01.000 --> 00:04.000 position:10%
+The station clock is seven minutes slow.
+
+NOTE This block is metadata and must remain unchanged.
+Reviewer: internal
+
+00:04.500 --> 00:08.000
+<v Mara>Were?</v> she prompted.

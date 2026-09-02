@@ -1,0 +1,12 @@
+1
+00:00:01,000 --> 00:00:04,200
+The northern gate was already open.
+
+2
+00:00:04,500 --> 00:00:08,000
+- Did anyone see who opened it?
+- No. The guard was gone when I arrived.
+
+3
+00:00:08,400 --> 00:00:11,700
+Keep the gate in sight, and do not touch the lock.
