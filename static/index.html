@@ -34,14 +34,18 @@
   button.quiet{border-color:var(--line);background:#000;color:var(--ink-soft)}
   button.on{background:#fff;border-color:#fff;color:#000}
 
-  header{height:58px;display:flex;align-items:center;justify-content:space-between;padding:0 20px;border-bottom:1px solid #fff;background:#000}
+  header{height:58px;display:grid;grid-template-columns:1fr auto 1fr;align-items:center;padding:0 20px;border-bottom:1px solid #fff;background:#000}
   .brand h1{font:700 18px/1 var(--sans);letter-spacing:.12em}
-  .srv{display:flex;align-items:center;gap:8px;color:var(--ink-soft);font:12px var(--mono)}
+  .view-nav{display:flex;align-items:stretch;height:100%;border-left:1px solid var(--line);border-right:1px solid var(--line)}
+  .view-nav button{min-width:116px;height:100%;padding:0 18px;border:0;border-right:1px solid var(--line);background:#000;color:var(--ink-soft);font:12px var(--mono);letter-spacing:.06em}
+  .view-nav button:last-child{border-right:0}.view-nav button.active{background:#fff;color:#000;font-weight:700}
+  .srv{justify-self:end;display:flex;align-items:center;gap:8px;color:var(--ink-soft);font:12px var(--mono)}
   .dot{width:8px;height:8px;border-radius:0;background:#555}
   .dot.on{background:#fff}.dot.err{background:#fff;outline:1px solid #fff;outline-offset:2px}.dot.busy{background:#fff;animation:blink 1s steps(1) infinite}
   @keyframes blink{50%{opacity:.3}}
 
   main{--config-w:280px;--queue-w:360px;height:calc(100vh - 58px);display:grid;grid-template-columns:var(--config-w) 6px var(--queue-w) 6px minmax(520px,1fr);overflow:hidden;background:#000}
+  #documentPage[hidden]{display:none!important}
   .config-panel,.queue-panel,.detail-panel{min-width:0;min-height:0;background:var(--panel);contain:layout paint}
   .config-panel{display:flex;flex-direction:column}
   .splitter{position:relative;background:#1c1c1c;border-left:1px solid #333;border-right:1px solid #333;cursor:col-resize;z-index:5;touch-action:none;transition:background .1s linear}
@@ -135,6 +139,26 @@
   .dcell[data-editable="true"]{cursor:text}.dcell[data-editable="true"]:hover{background:#101010}
   @keyframes spin{to{transform:rotate(360deg)}}
   .empty{padding:28px 10px;text-align:center;color:var(--ink-faint);font-size:12px}
+  .dialog-page{height:calc(100vh - 58px);display:flex;flex-direction:column;overflow:hidden;background:#000}
+  .dialog-page[hidden]{display:none!important}
+  .dialog-toolbar{flex:none;display:flex;align-items:center;gap:12px;padding:12px 18px;border-bottom:1px solid var(--line-2);background:#050505}
+  .dialog-title{min-width:170px}.dialog-title strong{display:block;font-size:14px}.dialog-title span{display:block;color:var(--ink-faint);font:10px var(--mono)}
+  .dialog-language{display:flex;align-items:flex-end;gap:7px;flex:1}
+  .dialog-field{min-width:0}.dialog-field label{display:block;margin-bottom:3px;color:var(--ink-faint);font:9px var(--mono);letter-spacing:.08em}
+  .dialog-field select{min-width:150px;height:34px;border:1px solid #3a3a3a;border-radius:0;background:#000;color:#fff;padding:5px 28px 5px 8px;font:11px var(--mono)}
+  .dialog-field.style select{min-width:132px}
+  #dialogSwap{height:34px;padding:5px 11px;font:11px var(--mono)}
+  .dialog-actions{display:flex;align-items:center;gap:7px}.dialog-actions button{height:34px;min-width:68px;padding:5px 11px;font-size:11px}
+  .dialog-grid{flex:1;min-height:0;display:grid;grid-template-columns:1fr 1fr;background:#000}
+  .dialog-pane{min-width:0;min-height:0;display:flex;flex-direction:column;border-right:1px solid var(--line-2);background:#000}.dialog-pane:last-child{border-right:0}
+  .dialog-pane-head{height:42px;flex:none;display:flex;align-items:center;justify-content:space-between;padding:0 16px;border-bottom:1px solid var(--line);background:#080808;color:var(--ink-soft);font:10px var(--mono);letter-spacing:.12em}
+  .dialog-pane-head span:last-child{color:var(--ink-faint);letter-spacing:0}
+  #dialogInput,#dialogOutput{flex:1;min-height:0;width:100%;overflow:auto;border:0;border-radius:0;outline:0;background:#000;color:#fff;padding:22px 24px;font:15px/1.85 var(--sans);white-space:pre-wrap;overflow-wrap:anywhere;tab-size:4}
+  #dialogInput{resize:none}.dialog-pane.source:focus-within{box-shadow:inset 0 0 0 1px #fff}
+  #dialogInput::placeholder{color:#565656}
+  #dialogOutput{margin:0;color:#f5f5f5}.dialog-output-empty{color:var(--ink-faint)!important}
+  .dialog-footer{height:40px;flex:none;display:flex;align-items:center;justify-content:space-between;padding:0 18px;border-top:1px solid var(--line-2);background:#050505;color:var(--ink-faint);font:10px var(--mono)}
+  .dialog-progress{display:flex;align-items:center;gap:10px}.dialog-progress-track{width:150px;height:4px;border:1px solid #444;background:#000}.dialog-progress-track i{display:block;width:0;height:100%;background:#fff;transition:width .12s linear}
   .app-modal{position:fixed;inset:0;z-index:1000;display:grid;place-items:center;padding:24px;background:rgba(0,0,0,.76)}
   .app-modal[hidden]{display:none}
   .app-modal-box{width:min(520px,calc(100vw - 48px));border:1px solid #fff;background:#050505;color:#fff;box-shadow:12px 12px 0 #1d1d1d}
@@ -159,12 +183,16 @@
   <div class="brand">
     <h1>翻译工作台</h1>
   </div>
+  <nav class="view-nav" aria-label="功能页面">
+    <button id="navDocuments" class="active" type="button">文档翻译</button>
+    <button id="navDialog" type="button">对话翻译</button>
+  </nav>
   <div class="srv">
     <span class="dot" id="dot"></span><span id="srvTxt">检测服务器…</span>
   </div>
 </header>
 
-<main>
+<main id="documentPage">
   <!-- 配置 -->
   <aside class="config-panel">
     <div class="panel-head"><h2>配置</h2><span class="sub">CONFIG</span></div>
@@ -212,8 +240,8 @@
         </select></div>
       <div class="fld"><label>上下文模式</label>
         <select id="cfg_context_mode">
-          <option value="full" selected>1 · 尽量全文</option>
-          <option value="neighbor">2 · 邻近上下文</option>
+          <option value="full">1 · 尽量全文</option>
+          <option value="neighbor" selected>2 · 邻近上下文</option>
           <option value="unit">3 · 独立单元</option>
         </select>
         <div class="config-note" id="contextModeHint"></div>
@@ -254,8 +282,8 @@
           </select></div>
       </div></div>
       <div class="fld"><div class="row">
-        <div><label id="contextUnitsLabel">近期译文单元</label><input id="cfg_context_units" type="number" min="0" step="1" value="12" title="用于保持术语、称谓和语气；长文模式也作为窗口前向重叠"></div>
-        <div><label id="futureContextUnitsLabel">长文后向重叠</label><input id="cfg_future_context_units" type="number" min="0" step="1" value="6" title="仅在全文放不进上下文时，用于固定语义窗口之间的后向重叠"></div>
+        <div><label id="contextUnitsLabel">前文译文单元</label><input id="cfg_context_units" type="number" min="0" step="1" value="2" title="用于保持术语、称谓和语气；长文模式也作为窗口前向重叠"></div>
+        <div><label id="futureContextUnitsLabel">后文原文单元</label><input id="cfg_future_context_units" type="number" min="0" step="1" value="2" title="邻近模式下携带的后续完整原文单元数"></div>
       </div></div>
     </div>
     <div class="sec">
@@ -329,6 +357,38 @@
   </section>
 </main>
 
+<section class="dialog-page" id="dialogPage" hidden>
+  <div class="dialog-toolbar">
+    <div class="dialog-title"><strong>对话翻译</strong><span>DIRECT TRANSLATION</span></div>
+    <div class="dialog-language">
+      <div class="dialog-field"><label for="dialogSrc">源语言</label><select id="dialogSrc"></select></div>
+      <button id="dialogSwap" type="button" title="交换源语言和目标语言">交换</button>
+      <div class="dialog-field"><label for="dialogTgt">目标语言</label><select id="dialogTgt"></select></div>
+      <div class="dialog-field style"><label for="dialogStyle">翻译风格</label><select id="dialogStyle"></select></div>
+    </div>
+    <div class="dialog-actions">
+      <button class="primary" id="dialogGo" type="button">翻译</button>
+      <button class="danger" id="dialogStop" type="button" disabled>中断</button>
+      <button id="dialogCopy" type="button" disabled>复制译文</button>
+      <button class="quiet" id="dialogClear" type="button">清空</button>
+    </div>
+  </div>
+  <div class="dialog-grid">
+    <div class="dialog-pane source">
+      <div class="dialog-pane-head"><span>原文</span><span id="dialogInputCount">0 字符</span></div>
+      <textarea id="dialogInput" spellcheck="false" placeholder="输入一句或一段文字，按 Ctrl + Enter 开始翻译"></textarea>
+    </div>
+    <div class="dialog-pane">
+      <div class="dialog-pane-head"><span>译文</span><span id="dialogOutputCount">0 字符</span></div>
+      <pre id="dialogOutput" class="dialog-output-empty">译文会在这里实时显示</pre>
+    </div>
+  </div>
+  <div class="dialog-footer">
+    <span id="dialogStatus">就绪 · 使用当前模型配置和补充要求，不创建文件任务</span>
+    <div class="dialog-progress"><span id="dialogPct">0%</span><span class="dialog-progress-track"><i id="dialogBar"></i></span></div>
+  </div>
+</section>
+
 <div class="app-modal" id="appModal" role="dialog" aria-modal="true" aria-labelledby="appModalTitle" hidden>
   <div class="app-modal-box">
     <div class="app-modal-head" id="appModalTitle">提示</div>
@@ -371,6 +431,8 @@ let taskListScrollTop = 0;
 let streamScrollFrame = 0;
 let modalResolve = null, modalCancelValue = null;
 let pdfPageDraft = null;
+let dialogJobId = null, dialogEs = null, dialogPollTimer = null;
+let dialogLines = [], dialogSubmitting = false, dialogInterrupting = false;
 $('list').addEventListener('scroll', () => { taskListScrollTop = $('list').scrollTop; }, {passive:true});
 
 function closeAppModal(value){
@@ -495,7 +557,7 @@ const LEGACY_SYSTEM_PROMPTS = [
 const CFG_DEFAULTS = {
   server:'http://127.0.0.1:8081', key:'local-qwen', model:'hy-mt2-7b', ctx:65536,
   temp:0.7, topk:20, topp:0.6, rp:1.05, src:'自动判断', tgt:'中文', style:'自动判断',
-  contextMode:'full', contextUnits:12, futureContextUnits:6,
+  contextMode:'neighbor', contextUnits:2, futureContextUnits:2,
   thinking:false, pdfStrict:true, sys:''
 };
 function setThinkingMode(enabled){
@@ -519,7 +581,7 @@ function setPdfStrictLayout(enabled){
     : '允许无法原位替换的页面使用旧版自动重排';
 }
 function updateContextModeUI(mode){
-  const selected=['full','neighbor','unit'].includes(mode) ? mode : 'full';
+  const selected=['full','neighbor','unit'].includes(mode) ? mode : 'neighbor';
   const contextInput=$('cfg_context_units');
   const futureInput=$('cfg_future_context_units');
   const independent=selected==='unit';
@@ -582,13 +644,22 @@ try{
     }else if(savedCfg.sys == null || LEGACY_SYSTEM_PROMPTS.includes(savedCfg.sys)){
       savedCfg.sys = '';
     }
+    // v4 把文件翻译默认值改为邻近单元，上下各 2；只迁移一次，之后尊重用户选择。
+    if(localStorage.getItem('bench_context_migration') !== '4'){
+      savedCfg.contextMode = 'neighbor';
+      savedCfg.contextUnits = 2;
+      savedCfg.futureContextUnits = 2;
+      localStorage.setItem('bench_context_migration', '4');
+    }
     localStorage.setItem('bench_cfg', JSON.stringify(savedCfg));
+  }else{
+    localStorage.setItem('bench_context_migration', '4');
   }
   writeCfg(savedCfg);
 }catch(e){ writeCfg(CFG_DEFAULTS); }
 
 /* ---------- 可调三栏宽度 ---------- */
-const workspace = document.querySelector('main');
+const workspace = $('documentPage');
 function clamp(n, min, max){ return Math.max(min, Math.min(max, n)); }
 function calculateLayout(configWidth, queueWidth, total=workspace.clientWidth){
   const configMax = Math.max(220, Math.min(420, total - 280 - 12 - 520));
@@ -652,6 +723,244 @@ document.querySelectorAll('.splitter').forEach(handle => {
 window.addEventListener('resize', () => {
   const styles = getComputedStyle(workspace);
   applyLayout(parseFloat(styles.getPropertyValue('--config-w')), parseFloat(styles.getPropertyValue('--queue-w')));
+});
+
+/* ---------- 文档 / 对话页面 ---------- */
+function syncDialogSelectors(){
+  if(!$('dialogSrc').options.length){
+    $('dialogSrc').innerHTML=$('cfg_src').innerHTML;
+    $('dialogTgt').innerHTML=$('cfg_tgt').innerHTML;
+    $('dialogStyle').innerHTML=$('cfg_style').innerHTML;
+  }
+  const cfg=readCfg();
+  $('dialogSrc').value=cfg.src;
+  $('dialogTgt').value=cfg.tgt;
+  $('dialogStyle').value=cfg.style;
+  $('dialogSwap').disabled=cfg.src==='自动判断' || !!dialogJobId;
+}
+function showPage(name){
+  const dialog=name==='dialog';
+  $('documentPage').hidden=dialog;
+  $('dialogPage').hidden=!dialog;
+  $('navDocuments').classList.toggle('active',!dialog);
+  $('navDialog').classList.toggle('active',dialog);
+  $('navDocuments').setAttribute('aria-current',dialog ? 'false' : 'page');
+  $('navDialog').setAttribute('aria-current',dialog ? 'page' : 'false');
+  if(dialog) syncDialogSelectors();
+  localStorage.setItem('bench_view',dialog ? 'dialog' : 'documents');
+}
+$('navDocuments').addEventListener('click',()=>showPage('documents'));
+$('navDialog').addEventListener('click',()=>showPage('dialog'));
+showPage(localStorage.getItem('bench_view')==='dialog' ? 'dialog' : 'documents');
+
+function saveDialogConfig(){
+  $('cfg_src').value=$('dialogSrc').value;
+  const targetChanged=$('cfg_tgt').value!==$('dialogTgt').value;
+  $('cfg_tgt').value=$('dialogTgt').value;
+  $('cfg_style').value=$('dialogStyle').value;
+  localStorage.setItem('bench_cfg',JSON.stringify(readCfg()));
+  $('dialogSwap').disabled=$('dialogSrc').value==='自动判断' || !!dialogJobId;
+  if(targetChanged) $('cfg_tgt').dispatchEvent(new Event('change'));
+}
+$('dialogSrc').addEventListener('change',saveDialogConfig);
+$('dialogTgt').addEventListener('change',saveDialogConfig);
+$('dialogStyle').addEventListener('change',saveDialogConfig);
+$('dialogSwap').addEventListener('click',()=>{
+  if($('dialogSrc').value==='自动判断' || dialogJobId) return;
+  const source=$('dialogSrc').value;
+  $('dialogSrc').value=$('dialogTgt').value;
+  $('dialogTgt').value=source;
+  saveDialogConfig();
+});
+
+let dialogPollBusy=false;
+function setDialogProgress(done=0,total=0){
+  const pct=total ? Math.round(done/total*100) : 0;
+  $('dialogPct').textContent=total ? `${pct}% · ${done}/${total}` : '0%';
+  $('dialogBar').style.width=pct+'%';
+}
+function renderDialogOutput(){
+  const text=dialogLines.join('\n');
+  const hasText=!!text.trim();
+  $('dialogOutput').textContent=hasText ? text : (dialogJobId ? '等待模型输出…' : '译文会在这里实时显示');
+  $('dialogOutput').classList.toggle('dialog-output-empty',!hasText);
+  $('dialogOutputCount').textContent=`${hasText ? text.length : 0} 字符`;
+  $('dialogCopy').disabled=!hasText;
+}
+function resetDialogLines(source){
+  dialogLines=String(source).replace(/\r\n/g,'\n').replace(/\r/g,'\n').split('\n').map(()=> '');
+  renderDialogOutput();
+}
+function applyDialogPartials(partials){
+  const groups=Object.values(partials||{});
+  const lines=groups.length ? groups[0] : {};
+  for(const [line,text] of Object.entries(lines||{})){
+    const index=Number(line);
+    if(Number.isInteger(index) && index>=0){
+      while(dialogLines.length<=index) dialogLines.push('');
+      dialogLines[index]=String(text||'');
+    }
+  }
+  renderDialogOutput();
+}
+function setDialogBusy(busy){
+  $('dialogGo').disabled=busy || dialogSubmitting;
+  $('dialogStop').disabled=!busy || dialogInterrupting;
+  $('dialogInput').disabled=busy;
+  $('dialogSrc').disabled=busy;
+  $('dialogTgt').disabled=busy;
+  $('dialogStyle').disabled=busy;
+  $('dialogSwap').disabled=busy || $('dialogSrc').value==='自动判断';
+}
+function finishDialogJob(status,result=null,error=''){
+  if(dialogEs){ dialogEs.close(); dialogEs=null; }
+  if(dialogPollTimer){ clearInterval(dialogPollTimer); dialogPollTimer=null; }
+  if(result && typeof result.content==='string'){
+    dialogLines=result.content.split('\n');
+    renderDialogOutput();
+    setDialogProgress(1,1);
+  }
+  dialogJobId=null;
+  dialogInterrupting=false;
+  sessionStorage.removeItem('bench_dialog_job');
+  renderDialogOutput();
+  setDialogBusy(false);
+  if(status==='interrupted') $('dialogStatus').textContent='已中断 · 已生成的译文保留在当前页面';
+  else if(error) $('dialogStatus').textContent='翻译失败 · '+error;
+  else $('dialogStatus').textContent='翻译完成 · 结果未写入磁盘';
+}
+async function pollDialogJob(){
+  if(!dialogJobId || dialogPollBusy) return;
+  dialogPollBusy=true;
+  let data;
+  try{
+    const response=await fetch('/api/status?job='+encodeURIComponent(dialogJobId)+'&full=1');
+    data=await response.json();
+  }catch(_){ dialogPollBusy=false; return; }
+  dialogPollBusy=false;
+  if(data.status==='notfound'){
+    finishDialogJob('error',null,'后端已重启，无法恢复本次请求');
+    return;
+  }
+  applyDialogPartials(data.partials);
+  setDialogProgress(data.current_file_done,data.current_file_total);
+  if(data.status==='done' || data.status==='interrupted'){
+    const result=(data.results||[])[0]||null;
+    finishDialogJob(data.status,result,result?.status==='error' ? (result.error||data.error||'未知错误') : '');
+  }
+}
+function connectDialogSSE(jid){
+  if(dialogEs) dialogEs.close();
+  dialogEs=new EventSource('/api/stream?job='+encodeURIComponent(jid));
+  dialogEs.addEventListener('dialog_chunk',event=>{
+    try{
+      const data=JSON.parse(event.data), line=Number(data.line);
+      while(dialogLines.length<=line) dialogLines.push('');
+      dialogLines[line]=String(data.text||'');
+      renderDialogOutput();
+      $('dialogStatus').textContent='正在翻译…';
+    }catch(_){}
+  });
+  dialogEs.addEventListener('dialog_progress',event=>{
+    try{ const data=JSON.parse(event.data); setDialogProgress(data.done,data.total); }catch(_){}
+  });
+  dialogEs.addEventListener('dialog_done',event=>{
+    try{ const data=JSON.parse(event.data); dialogLines=String(data.content||'').split('\n'); renderDialogOutput(); }catch(_){}
+  });
+  dialogEs.addEventListener('dialog_fail',event=>{
+    try{ const data=JSON.parse(event.data); $('dialogStatus').textContent='翻译失败 · '+(data.message||'未知错误'); }catch(_){}
+  });
+  const terminal=()=>{ if(dialogEs){ dialogEs.close(); dialogEs=null; } pollDialogJob(); };
+  dialogEs.addEventListener('done',terminal);
+  dialogEs.addEventListener('interrupted',terminal);
+  dialogEs.onerror=()=>{
+    if(dialogEs){ dialogEs.close(); dialogEs=null; }
+    if(dialogJobId) setTimeout(()=>{ if(dialogJobId) connectDialogSSE(dialogJobId); },2000);
+  };
+}
+async function startDialogTranslation(){
+  const source=$('dialogInput').value.replace(/\r\n/g,'\n').replace(/\r/g,'\n');
+  if(!source.trim()){
+    await appAlert('请先输入要翻译的文字。','没有原文');
+    $('dialogInput').focus();
+    return;
+  }
+  if(jobId){
+    await appAlert('文档翻译正在运行，请先等待完成或中断当前任务。','任务正在运行');
+    return;
+  }
+  if(dialogJobId || dialogSubmitting) return;
+  dialogSubmitting=true;
+  setDialogBusy(false);
+  $('dialogStatus').textContent='正在启动翻译…';
+  try{
+    const response=await fetch('/api/dialog-translate',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({config:requestConfig(),text:source})
+    });
+    const data=await response.json().catch(()=>({}));
+    if(!response.ok || !data.job) throw new Error(data.error||`HTTP ${response.status}`);
+    dialogJobId=data.job;
+    sessionStorage.setItem('bench_dialog_job',dialogJobId);
+    resetDialogLines(source);
+    setDialogProgress(0,0);
+    $('dialogStatus').textContent='正在翻译…';
+    connectDialogSSE(dialogJobId);
+    dialogPollTimer=setInterval(pollDialogJob,5000);
+  }catch(error){
+    $('dialogStatus').textContent='启动失败 · '+error.message;
+    await appAlert('启动失败：'+error.message,'启动失败');
+  }finally{
+    dialogSubmitting=false;
+    setDialogBusy(!!dialogJobId);
+  }
+}
+async function interruptDialogTranslation(){
+  if(!dialogJobId || dialogInterrupting) return;
+  dialogInterrupting=true;
+  setDialogBusy(true);
+  $('dialogStatus').textContent='正在中断…';
+  try{
+    const response=await fetch('/api/interrupt',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({job:dialogJobId})
+    });
+    const data=await response.json().catch(()=>({}));
+    if(!response.ok || !data.ok) throw new Error(data.error||`HTTP ${response.status}`);
+  }catch(error){
+    dialogInterrupting=false;
+    setDialogBusy(true);
+    $('dialogStatus').textContent='中断失败 · '+error.message;
+  }
+}
+$('dialogGo').addEventListener('click',startDialogTranslation);
+$('dialogStop').addEventListener('click',interruptDialogTranslation);
+$('dialogInput').addEventListener('input',()=>{
+  $('dialogInputCount').textContent=`${$('dialogInput').value.length} 字符`;
+});
+$('dialogInput').addEventListener('keydown',event=>{
+  if(event.key==='Enter' && (event.ctrlKey || event.metaKey)){
+    event.preventDefault(); startDialogTranslation();
+  }
+});
+$('dialogClear').addEventListener('click',()=>{
+  if(dialogJobId) return;
+  $('dialogInput').value='';
+  $('dialogInputCount').textContent='0 字符';
+  dialogLines=[];
+  renderDialogOutput();
+  setDialogProgress(0,0);
+  $('dialogStatus').textContent='就绪 · 使用当前模型配置和补充要求，不创建文件任务';
+  $('dialogInput').focus();
+});
+$('dialogCopy').addEventListener('click',async()=>{
+  const text=dialogLines.join('\n');
+  if(!text.trim()) return;
+  try{
+    await navigator.clipboard.writeText(text);
+    const button=$('dialogCopy'); button.textContent='已复制';
+    setTimeout(()=>{ button.textContent='复制译文'; },1000);
+  }catch(error){ await appAlert('复制失败：'+error.message,'复制失败'); }
 });
 
 /* ---------- 服务器状态 ---------- */
@@ -2310,10 +2619,54 @@ async function reconnectJob(){
     render();
   }catch(e){}
 }
+async function reconnectDialogJob(){
+  let jid=sessionStorage.getItem('bench_dialog_job');
+  async function findRunningDialog(){
+    try{
+      const response=await fetch('/api/running?kind=dialog');
+      const data=await response.json();
+      return data.job||null;
+    }catch(_){ return null; }
+  }
+  if(!jid) jid=await findRunningDialog();
+  if(!jid) return;
+  try{
+    let response=await fetch('/api/status?job='+encodeURIComponent(jid)+'&full=1');
+    let data=await response.json();
+    if(!data.status || data.status==='notfound' || data.kind!=='dialog'){
+      sessionStorage.removeItem('bench_dialog_job');
+      jid=await findRunningDialog();
+      if(!jid) return;
+      response=await fetch('/api/status?job='+encodeURIComponent(jid)+'&full=1');
+      data=await response.json();
+      if(!data.status || data.status==='notfound' || data.kind!=='dialog') return;
+    }
+    const source=data.sources?.[0]?.content;
+    if(typeof source==='string'){
+      $('dialogInput').value=source;
+      $('dialogInputCount').textContent=`${source.length} 字符`;
+      resetDialogLines(source);
+    }
+    dialogJobId=jid;
+    applyDialogPartials(data.partials);
+    setDialogProgress(data.current_file_done,data.current_file_total);
+    if(data.status==='done' || data.status==='interrupted'){
+      const result=(data.results||[])[0]||null;
+      finishDialogJob(data.status,result,result?.status==='error' ? (result.error||data.error||'未知错误') : '');
+      return;
+    }
+    sessionStorage.setItem('bench_dialog_job',jid);
+    setDialogBusy(true);
+    $('dialogStatus').textContent='正在翻译…';
+    connectDialogSSE(jid);
+    dialogPollTimer=setInterval(pollDialogJob,5000);
+  }catch(_){}
+}
 async function init(){
   await restoreFiles();
   lastJob = localStorage.getItem('bench_lastjob');
   await reconnectJob();
+  await reconnectDialogJob();
   await markOutputsDone();
   render();
 }

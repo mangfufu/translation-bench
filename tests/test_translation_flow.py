@@ -93,7 +93,7 @@ class TranslationFlowTests(unittest.TestCase):
         self.assertIsNone(translator._conn)
 
     def test_each_physical_position_is_a_separate_request(self):
-        translator = FakeTranslator()
+        translator = FakeTranslator(context_mode="full")
         emitted = []
         progress = []
         checkpoints = []
@@ -265,15 +265,32 @@ class TranslationFlowTests(unittest.TestCase):
             self.assertNotIn("【邻近下文参考", prompt)
             self.assertTrue(prompt.endswith(source))
 
-    def test_invalid_context_mode_falls_back_to_full(self):
+    def test_default_context_is_two_neighbor_units(self):
+        translator = Translator({})
+
+        self.assertEqual(translator._context_mode(), "neighbor")
+        self.assertEqual(translator.cfg["context_units"], 2)
+        self.assertEqual(translator.cfg["future_context_units"], 2)
+
+    def test_plain_dialog_text_does_not_apply_markdown_structure_rules(self):
+        translator = FakeTranslator(context_mode="unit")
+
+        ok, output = translator.translate_content(
+            "# not a heading\n---", plain_text=True
+        )
+
+        self.assertTrue(ok, output)
+        self.assertEqual(translator.sources, ["# not a heading", "---"])
+        self.assertEqual(output, "译：# not a heading\n译：---")
+
+    def test_invalid_context_mode_falls_back_to_neighbor(self):
         translator = FakeTranslator(context_mode="unknown")
 
         ok, output = translator.translate_content("One.\nTwo.")
 
         self.assertTrue(ok, output)
-        self.assertTrue(
-            all("【固定全文原文参考" in prompt for prompt in translator.prompts)
-        )
+        self.assertTrue(all("【固定" not in prompt for prompt in translator.prompts))
+        self.assertIn("【邻近下文参考", translator.prompts[0])
 
     def test_srt_translates_only_caption_text(self):
         translator = FakeTranslator(context_mode="full")
@@ -535,6 +552,75 @@ class TranslationFlowTests(unittest.TestCase):
             self.assertEqual(snapshot["partials"]["sample.txt"]["0"], "译文")
             self.assertEqual(snapshot["sources"][0]["content"], "Source")
         finally:
+            with app.JOBS_LOCK:
+                app.JOBS.pop(job_id, None)
+
+    def test_dialog_job_streams_without_writing_an_output_file(self):
+        class DialogTranslator:
+            interrupted = False
+
+            def __init__(self, config):
+                self.config = config
+
+            @staticmethod
+            def translate_content(
+                content, filename, emit=None, progress=None, plain_text=False,
+            ):
+                if not plain_text:
+                    return False, "对话任务没有启用纯文本模式"
+                if progress:
+                    progress(0, 2)
+                if emit:
+                    emit(0, "你")
+                    emit(0, "你好")
+                    emit(1, "世界")
+                if progress:
+                    progress(2, 2)
+                return True, "你好\n世界"
+
+            @staticmethod
+            def close():
+                pass
+
+        job_id = "dialog-test"
+        job = {
+            "kind": "dialog",
+            "status": "running",
+            "total": 1,
+            "done": 0,
+            "current": "",
+            "results": [],
+            "config": {"tgt_lang": "中文"},
+            "files": [{"name": "即时文本", "content": "Hello\nworld"}],
+            "current_file_done": 0,
+            "current_file_total": 0,
+            "q": queue.Queue(maxsize=32),
+            "interrupt": False,
+            "done_names": [],
+            "partials": {},
+            "completed_partials": {},
+            "created_at": time.time(),
+        }
+        original_translator = app.Translator
+        with app.JOBS_LOCK:
+            app.JOBS[job_id] = job
+        try:
+            app.Translator = DialogTranslator
+            app.run_dialog_job(job_id)
+            snapshot = app.job_status_snapshot(job_id, requested_full=True)
+            events = []
+            while not job["q"].empty():
+                events.append(job["q"].get_nowait())
+
+            self.assertEqual(snapshot["kind"], "dialog")
+            self.assertEqual(snapshot["status"], "done")
+            self.assertEqual(snapshot["results"][0]["content"], "你好\n世界")
+            self.assertEqual(snapshot["partials"]["即时文本"]["0"], "你好")
+            self.assertIn("dialog_chunk", [event["kind"] for event in events])
+            self.assertIn("dialog_done", [event["kind"] for event in events])
+            self.assertEqual(events[-1]["kind"], "done")
+        finally:
+            app.Translator = original_translator
             with app.JOBS_LOCK:
                 app.JOBS.pop(job_id, None)
 

@@ -106,9 +106,9 @@ DEFAULT_CONFIG = {
     "repeat_penalty": 1.05,
     "enable_thinking": False,     # 翻译默认关闭思考模式，避免额外推理和输出污染
     "pdf_strict_layout": True,    # PDF 默认只原位替换，禁止自动重排页面
-    "context_mode": "full",      # full=尽量全文，neighbor=邻近上下文，unit=独立单元
-    "context_units": 12,          # 最近确认译文单元；长文窗口也用作前向重叠
-    "future_context_units": 6,    # 长文固定窗口向后的完整单元重叠
+    "context_mode": "neighbor",   # full=尽量全文，neighbor=邻近上下文，unit=独立单元
+    "context_units": 2,            # 最近确认译文单元；长文窗口也用作前向重叠
+    "future_context_units": 2,     # 后续原文单元；全文模式也用作窗口后向重叠
     "max_retries": 5,
     "src_lang": "自动判断",
     "tgt_lang": "中文",
@@ -1027,8 +1027,8 @@ class Translator:
 
     def _context_mode(self):
         """返回有效上下文模式；旧配置和非法值均回退到默认模式。"""
-        mode = str(self.cfg.get("context_mode", "full")).strip().lower()
-        return mode if mode in {"full", "neighbor", "unit"} else "full"
+        mode = str(self.cfg.get("context_mode", "neighbor")).strip().lower()
+        return mode if mode in {"full", "neighbor", "unit"} else "neighbor"
 
     def _active_reference_plan(self, content, translatable, filename=""):
         """只有“尽量全文”模式才构建全文或固定语义窗口参考。"""
@@ -1195,7 +1195,7 @@ class Translator:
         """选择最近的完整 (原文, 译文) 单元，不从字符中间截断。"""
         if self._context_mode() == "unit":
             return ""
-        unit_limit = max(0, int(self.cfg.get("context_units", 12)))
+        unit_limit = max(0, int(self.cfg.get("context_units", 2)))
         if not history or unit_limit == 0:
             return ""
         token_limit, _ = self._context_token_caps()
@@ -1214,7 +1214,7 @@ class Translator:
         """选择接下来的完整原文单元，不从句子中间截断。"""
         if self._context_mode() == "unit":
             return ""
-        unit_limit = max(0, int(self.cfg.get("future_context_units", 6)))
+        unit_limit = max(0, int(self.cfg.get("future_context_units", 2)))
         if not sources or unit_limit == 0:
             return ""
         _, token_limit = self._context_token_caps()
@@ -1430,13 +1430,16 @@ class Translator:
     def translate_content(
         self, content, filename="", emit=None, progress=None,
         previous_content=None, resume_lines=None, checkpoint=None,
-        continuation_hints=None,
+        continuation_hints=None, plain_text=False,
     ):
         """翻译文件内容，逐个物理位置生成并保持 Markdown 结构。"""
         content = normalize_text_content(content)[0]
         lines = content.split("\n")
         out = list(lines)
-        units = self._document_units(content, filename)
+        units = (
+            [self._plain_unit(line) for line in lines]
+            if plain_text else self._document_units(content, filename)
+        )
         for line_index, line in enumerate(lines):
             unit = units[line_index]
             if not unit["translate"] and line.strip() and emit:
@@ -1655,6 +1658,81 @@ def run_job(job_id):
         emit("done", total=len(files))
 
 
+def run_dialog_job(job_id):
+    """翻译临时输入，不创建文件任务，也不向磁盘写入译文。"""
+    job = JOBS[job_id]
+    translator = Translator(job["config"])
+    name = job["files"][0]["name"]
+    content = job["files"][0]["content"]
+    with JOBS_LOCK:
+        job["translator"] = translator
+        job["current"] = name
+
+    def emit(kind, **kw):
+        enqueue_job_event(job, {"kind": kind, **kw})
+
+    def emit_line(line_no, text):
+        with JOBS_LOCK:
+            job["partials"].setdefault(name, {})[str(line_no)] = text
+        emit("dialog_chunk", line=line_no, text=text)
+
+    def emit_progress(done, total):
+        with JOBS_LOCK:
+            job["current_file_done"] = done
+            job["current_file_total"] = total
+        emit("dialog_progress", done=done, total=total)
+
+    try:
+        if job.get("interrupt"):
+            ok, output = False, "任务已中断"
+        else:
+            ok, output = translator.translate_content(
+                content,
+                "dialog.txt",
+                emit=emit_line,
+                progress=emit_progress,
+                plain_text=True,
+            )
+        if job.get("interrupt") or translator.interrupted:
+            job["status"] = "interrupted"
+        elif ok:
+            job["results"] = [{
+                "name": name,
+                "status": "ok",
+                "content": output,
+                "target_language": job["config"].get("tgt_lang", "中文"),
+            }]
+            job["done"] = 1
+            job["done_names"] = [name]
+            job["status"] = "done"
+            emit("dialog_done", content=output)
+        else:
+            job["error"] = output
+            job["results"] = [{"name": name, "status": "error", "error": output}]
+            job["status"] = "done"
+            emit("dialog_fail", message=output)
+    except Exception as exc:
+        if job.get("interrupt") or translator.interrupted:
+            job["status"] = "interrupted"
+        else:
+            message = str(exc)
+            job["error"] = message
+            job["results"] = [{"name": name, "status": "error", "error": message}]
+            job["status"] = "done"
+            emit("dialog_fail", message=message)
+    finally:
+        translator.close()
+        with JOBS_LOCK:
+            job.pop("translator", None)
+            job["current"] = ""
+            job["finished_at"] = time.time()
+
+    if job["status"] == "interrupted":
+        emit("interrupted", total=1)
+    else:
+        emit("done", total=1)
+
+
 def prune_jobs():
     """保留正在运行的任务，清理超时或过多的已结束任务。"""
     now = time.time()
@@ -1710,6 +1788,7 @@ def job_status_snapshot(job_id, requested_full=False):
         snapshot = {
             key: job.get(key)
             for key in (
+                "kind",
                 "status",
                 "total",
                 "done",
@@ -1876,8 +1955,13 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._send_json(base)
         elif path == "/api/running":
+            requested_kind = query.get("kind", ["document"])[0]
             with JOBS_LOCK:
-                running = [jid for jid, j in JOBS.items() if j.get("status") == "running"]
+                running = [
+                    jid for jid, j in JOBS.items()
+                    if j.get("status") == "running"
+                    and j.get("kind", "document") == requested_kind
+                ]
             self._send_json({"job": running[0] if running else None})
         elif path == "/api/source":
             source_id = query.get("id", [""])[0]
@@ -2450,6 +2534,56 @@ class Handler(BaseHTTPRequestHandler):
                     j["priority"] = body.get("names", [])
             self._send_json({"ok": bool(j)})
             return
+        if path == "/api/dialog-translate":
+            try:
+                body = self._read_body()
+            except Exception:
+                self._send_json({"error": "bad json"}, 400)
+                return
+            if not isinstance(body, dict) or not isinstance(body.get("config", {}), dict):
+                self._send_json({"error": "invalid config"}, 400)
+                return
+            text = body.get("text")
+            if not isinstance(text, str) or not text.strip():
+                self._send_json({"error": "请输入要翻译的文字"}, 400)
+                return
+            text = normalize_text_content(text)[0]
+            prune_jobs()
+            job_id = uuid.uuid4().hex[:12]
+            with JOBS_LOCK:
+                conflict = any(
+                    existing.get("status") == "running"
+                    for existing in JOBS.values()
+                )
+                if not conflict:
+                    name = "即时文本"
+                    JOBS[job_id] = {
+                        "kind": "dialog",
+                        "status": "running",
+                        "total": 1,
+                        "done": 0,
+                        "current": "",
+                        "results": [],
+                        "config": body.get("config", {}),
+                        "files": [{"name": name, "content": text}],
+                        "current_file_done": 0,
+                        "current_file_total": 0,
+                        "q": queue.Queue(maxsize=SSE_QUEUE_MAX_EVENTS),
+                        "interrupt": False,
+                        "priority": [],
+                        "done_names": [],
+                        "partials": {},
+                        "completed_partials": {},
+                        "created_at": time.time(),
+                    }
+            if conflict:
+                self._send_json({"error": "已有翻译任务正在运行，请先中断或等待完成"}, 409)
+                return
+            threading.Thread(
+                target=run_dialog_job, args=(job_id,), daemon=True
+            ).start()
+            self._send_json({"job": job_id})
+            return
         if path != "/api/translate":
             self._send_json({"error": "unknown path"}, 404)
             return
@@ -2572,6 +2706,7 @@ class Handler(BaseHTTPRequestHandler):
             )
             if not conflict:
                 JOBS[job_id] = {
+                    "kind": "document",
                     "status": "running", "total": len(files), "done": 0,
                     "current": "", "results": [], "config": cfg, "files": files,
                     "current_file_done": 0, "current_file_total": 0,
