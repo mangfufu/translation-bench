@@ -118,6 +118,8 @@
   .pdf-range{order:3;flex:0 0 100%;display:flex;align-items:center;gap:8px;padding:6px 0 0;border:0;border-top:1px solid var(--line);background:transparent;color:var(--ink-soft);font:10px var(--mono);white-space:nowrap}
   .pdf-range[hidden]{display:none}.pdf-range .pdf-page-summary{min-width:0;max-width:min(52vw,520px);overflow:hidden;text-overflow:ellipsis;color:#fff}
   .pdf-range button{padding:4px 8px;font:10px var(--mono)}
+  .pdf-range select{height:25px;border:1px solid #3a3a3a;border-radius:0;outline:0;background:#000;color:#fff;padding:3px 25px 3px 7px;font:10px var(--mono)}
+  .pdf-range select:focus{border-color:#fff}.pdf-range select:disabled{opacity:.35;cursor:not-allowed}
   .detail-actions{display:flex;align-items:center;gap:7px}.detail-actions button{padding:6px 10px;font-size:11px;display:inline-flex;align-items:center;justify-content:center;gap:6px;white-space:nowrap}
   #detail{flex:1;min-height:0;overflow:hidden;padding:0}
   .detail-empty{height:100%;display:grid;place-items:center;border:0;border-radius:0;color:var(--ink-faint);text-align:center;background:#000}.detail-empty strong{display:block;color:var(--ink-soft);font:600 15px var(--sans);margin-bottom:4px}
@@ -350,6 +352,12 @@
         <span>翻译页</span>
         <span class="pdf-page-summary" id="pdfPageSummary">全部页面</span>
         <button id="btnPdfPages" type="button">选择页面</button>
+        <span>识别</span>
+        <select id="pdfRecognitionMode" title="自动混合：优先读取文字层，仅对缺少文字的页面使用 OCR；仅文字层：不做 OCR；强制 OCR：忽略文字层并重新识别全部所选页面">
+          <option value="auto">自动混合</option>
+          <option value="text">仅文字层</option>
+          <option value="ocr">强制 OCR</option>
+        </select>
       </div>
       <div class="detail-actions">
         <button class="primary" id="btnCurrentGo" disabled>翻译当前文件</button>
@@ -1004,7 +1012,20 @@ $('drop').addEventListener('drop', e => addFiles([...e.dataTransfer.files]));
 
 const TEXT_DOCUMENT_EXTENSIONS=['.md','.txt','.text','.markdown','.srt','.vtt'];
 const BINARY_DOCUMENT_EXTENSIONS=['.docx','.epub','.pdf'];
-const PDF_EXTRACTION_VERSION=6;
+const PDF_EXTRACTION_VERSION=7;
+function normalizePdfRecognitionMode(value){
+  return ['auto','text','ocr'].includes(String(value||'').toLowerCase())
+    ? String(value).toLowerCase() : 'auto';
+}
+function pdfRecognitionLabel(value){
+  return {auto:'自动混合',text:'仅文字层',ocr:'强制 OCR'}[normalizePdfRecognitionMode(value)];
+}
+function pdfSourceUrl(file,selection,mode){
+  return '/api/source?id=' + encodeURIComponent(file.source_id) +
+    '&format=pdf&sha256=' + encodeURIComponent(file.source_sha256||'') +
+    '&pages=' + encodeURIComponent(selection) +
+    '&recognition_mode=' + encodeURIComponent(normalizePdfRecognitionMode(mode));
+}
 function pdfPageNumbers(file){
   const total=Math.max(0,Number(file?.pdf_page_count||0));
   if(!total) return [];
@@ -1068,11 +1089,12 @@ async function importTextFile(file){
   normalized.text_bom=hasUtf8Bom;
   return {...normalized,source_id:null,source_format:'text',source_sha256:null,
     pdf_page_count:null,pdf_page_start:null,pdf_page_end:null,pdf_page_selection:null,
-    pdf_extraction_version:null};
+    pdf_extraction_version:null,pdf_recognition_mode:'auto'};
 }
 async function importBinaryFile(file){
   $('cur').textContent='正在导入：' + file.name + ' · 大文件会直接写入磁盘';
-  const response=await fetch('/api/import?name=' + encodeURIComponent(file.name), {
+  const response=await fetch('/api/import?name=' + encodeURIComponent(file.name) +
+    '&recognition_mode=auto', {
     method:'POST', headers:{'Content-Type':'application/octet-stream'},
     body:file
   });
@@ -1122,9 +1144,11 @@ async function addFiles(list){
           : existing.content!==content) ||
           (extension==='.pdf' && (
             formatPdfPageSelection(pdfPageNumbers(existing),Number(existing.pdf_page_count||0))!==
-              String(imported.pdf_page_selection||'all') ||
+            String(imported.pdf_page_selection||'all') ||
             Number(existing.pdf_page_start||1)!==Number(imported.pdf_page_start||1) ||
-            Number(existing.pdf_page_end||imported.pdf_page_count)!==Number(imported.pdf_page_end||imported.pdf_page_count)
+            Number(existing.pdf_page_end||imported.pdf_page_count)!==Number(imported.pdf_page_end||imported.pdf_page_count) ||
+            normalizePdfRecognitionMode(existing.pdf_recognition_mode)!==
+              normalizePdfRecognitionMode(imported.pdf_recognition_mode)
           ))
         : existing.content!==content || (existing.text_eol||'lf')!==(imported.text_eol||'lf') ||
           !!existing.text_bom!==!!imported.text_bom);
@@ -1150,6 +1174,7 @@ async function addFiles(list){
       existing.pdf_page_selection=imported.pdf_page_selection||null;
       existing.pdf_extraction_version=imported.pdf_extraction_version||null;
       existing.pdf_ocr=!!imported.pdf_ocr;
+      existing.pdf_recognition_mode=normalizePdfRecognitionMode(imported.pdf_recognition_mode);
       existing.text_eol=imported.text_eol||'lf';
       existing.text_bom=!!imported.text_bom;
       if(sourceChanged){
@@ -1170,7 +1195,8 @@ async function addFiles(list){
       pdf_page_start:imported.pdf_page_start||null, pdf_page_end:imported.pdf_page_end||null,
       pdf_page_selection:imported.pdf_page_selection||null,
       pdf_extraction_version:imported.pdf_extraction_version||null,
-      pdf_ocr:!!imported.pdf_ocr});
+      pdf_ocr:!!imported.pdf_ocr,
+      pdf_recognition_mode:normalizePdfRecognitionMode(imported.pdf_recognition_mode)});
     if(imported.pdf_ocr) scannedPdfIndex=files.length-1;
   }
   $('cur').textContent='';
@@ -1574,7 +1600,7 @@ function detailMetaFor(f){
   if(BINARY_DOCUMENT_EXTENSIONS.includes(fileExtension(f.name))){
     const units=typeof f.content==='string' && f.content ? f.content.split('\n').length : 0;
     const pageRange=String(f.source_format||'').toLowerCase()==='pdf' && f.pdf_page_count
-      ? ` · ${pdfPageSelectionLabel(f,true)}`
+      ? ` · ${pdfPageSelectionLabel(f,true)} · ${pdfRecognitionLabel(f.pdf_recognition_mode)}`
       : '';
     return `${labels[f.status]||'待翻译'} · ${String(f.source_format||fileExtension(f.name).slice(1)).toUpperCase()}${pageRange} · ${units} 个文本单元`;
   }
@@ -1589,8 +1615,10 @@ function updateDetailControls(){
   $('pdfRange').hidden=!isPdf;
   if(isPdf){
     $('pdfPageSummary').textContent=pdfPageSelectionLabel(f);
+    $('pdfRecognitionMode').value=normalizePdfRecognitionMode(f.pdf_recognition_mode);
   }
   $('btnPdfPages').disabled=!isPdf || blocked;
+  $('pdfRecognitionMode').disabled=!isPdf || blocked;
   const currentGo=$('btnCurrentGo');
   if(f?.resume_retranslate) currentGo.textContent='继续重译当前文件';
   else if(Object.keys(f?.completed_lines||{}).length) currentGo.textContent='继续翻译当前文件';
@@ -1654,6 +1682,60 @@ function openPdfPagePicker(){
   $('pdfPageModal').hidden=false;
   requestAnimationFrame(()=>$('pdfPageGrid button.selected')?.focus());
 }
+function pdfHasTranslation(file){
+  return file.content_out!==null || Object.keys(file.live_out||{}).length ||
+    Object.keys(file.completed_lines||{}).length || !!file.legacy_out;
+}
+async function reloadPdfExtraction(file,pageNumbers,recognitionMode,warmPages=[]){
+  const total=Number(file.pdf_page_count||0);
+  const selection=formatPdfPageSelection(pageNumbers,total);
+  recognitionMode=normalizePdfRecognitionMode(recognitionMode);
+  submitting=true;
+  render();
+  try{
+    for(let index=0;index<warmPages.length;index++){
+      const page=warmPages[index];
+      $('cur').textContent=`正在 OCR 第 ${page} 页 · ${index+1}/${warmPages.length}`;
+      const pageResponse=await fetch(pdfSourceUrl(file,String(page),recognitionMode));
+      const pageResult=await pageResponse.json().catch(() => ({}));
+      if(!pageResponse.ok || !pageResult.ok){
+        throw new Error(pageResult.error || `第 ${page} 页 OCR 失败（HTTP ${pageResponse.status}）`);
+      }
+    }
+    $('cur').textContent=`正在以“${pdfRecognitionLabel(recognitionMode)}”读取所选 ${pageNumbers.length} 页：${file.name}`;
+    const response=await fetch(pdfSourceUrl(file,selection,recognitionMode));
+    const result=await response.json().catch(() => ({}));
+    if(!response.ok || !result.ok) throw new Error(result.error || `HTTP ${response.status}`);
+    const diskName=file.output_name || (file.content_out!==null
+      ? outputName(file.name,file.target_language||$('cfg_tgt').value) : '');
+    if(diskName){
+      const deleted=await fetch('/api/output?name=' + encodeURIComponent(diskName), {method:'DELETE'});
+      const deleteResult=await deleted.json().catch(() => ({}));
+      if(!deleted.ok || !deleteResult.ok) throw new Error(deleteResult.error || `HTTP ${deleted.status}`);
+    }
+    file.content=result.content;
+    file.pdf_page_count=result.pdf_page_count;
+    file.pdf_page_start=result.pdf_page_start;
+    file.pdf_page_end=result.pdf_page_end;
+    file.pdf_page_selection=result.pdf_page_selection||selection;
+    file.pdf_extraction_version=result.pdf_extraction_version||PDF_EXTRACTION_VERSION;
+    file.pdf_recognition_mode=normalizePdfRecognitionMode(result.pdf_recognition_mode||recognitionMode);
+    file.pdf_ocr=!!result.pdf_ocr;
+    file.status='q'; file.error=''; file.content_out=null; file.live_out={};
+    file.completed_lines={}; file.resume_retranslate=false; file.legacy_out='';
+    file.output_name=null; file.target_language=null; file.retry_queued=false;
+    $('cur').textContent=`已读取 ${pageNumbers.length} / ${total} 页 · ${pdfRecognitionLabel(file.pdf_recognition_mode)}`;
+    submitting=false;
+    render();
+    return true;
+  }catch(error){
+    submitting=false;
+    $('cur').textContent='';
+    render();
+    await appAlert('重新读取 PDF 失败：' + error.message,'设置失败');
+    return false;
+  }
+}
 async function applyPdfPageSelection(pageNumbers){
   if(jobId || submitting || lineRetranslating || lineSaving || lineEditing) return;
   const f=files[selectedIdx];
@@ -1661,66 +1743,41 @@ async function applyPdfPageSelection(pageNumbers){
   const total=Number(f.pdf_page_count||0);
   const selection=formatPdfPageSelection(pageNumbers,total);
   if(!selection){ await appAlert('至少选择一页。','页码选择无效'); return; }
-  const currentSelection=formatPdfPageSelection(pdfPageNumbers(f),total);
+  const currentPages=pdfPageNumbers(f);
+  const currentSelection=formatPdfPageSelection(currentPages,total);
   if(selection===currentSelection) return;
-  const hasTranslation=f.content_out!==null || Object.keys(f.live_out||{}).length ||
-    Object.keys(f.completed_lines||{}).length || !!f.legacy_out;
-  if(hasTranslation && !await appConfirm(
+  if(pdfHasTranslation(f) && !await appConfirm(
     `修改“${f.name}”的翻译页面？\n\n新选择：${selection==='all'?'全部页面':selection}\n现有译文、续译断点和关联磁盘译文会被清除，未选页面在新 PDF 中保持原样。`,
     '修改 PDF 翻译页面'
   )){
     updateDetailControls();
     return;
   }
-  $('btnPdfPages').disabled=true;
-  $('cur').textContent=`正在读取所选 ${pageNumbers.length} 页：${f.name}`;
-  try{
-    if(f.pdf_ocr){
-      const currentPages=new Set(pdfPageNumbers(f));
-      const addedPages=pageNumbers.filter(page=>!currentPages.has(page));
-      for(let index=0;index<addedPages.length;index++){
-        const page=addedPages[index];
-        $('cur').textContent=`正在 OCR 第 ${page} 页 · ${index+1}/${addedPages.length}`;
-        const pageResponse=await fetch('/api/source?id=' + encodeURIComponent(f.source_id) +
-          '&format=pdf&sha256=' + encodeURIComponent(f.source_sha256||'') +
-          '&pages=' + page);
-        const pageResult=await pageResponse.json().catch(() => ({}));
-        if(!pageResponse.ok || !pageResult.ok){
-          throw new Error(pageResult.error || `第 ${page} 页 OCR 失败（HTTP ${pageResponse.status}）`);
-        }
-      }
-      $('cur').textContent=`正在合并所选 ${pageNumbers.length} 页：${f.name}`;
-    }
-    const response=await fetch('/api/source?id=' + encodeURIComponent(f.source_id) +
-      '&format=pdf&sha256=' + encodeURIComponent(f.source_sha256||'') +
-      '&pages=' + encodeURIComponent(selection));
-    const result=await response.json().catch(() => ({}));
-    if(!response.ok || !result.ok) throw new Error(result.error || `HTTP ${response.status}`);
-    const diskName=f.output_name || (f.content_out!==null
-      ? outputName(f.name,f.target_language||$('cfg_tgt').value) : '');
-    if(diskName){
-      const deleted=await fetch('/api/output?name=' + encodeURIComponent(diskName), {method:'DELETE'});
-      const deleteResult=await deleted.json().catch(() => ({}));
-      if(!deleted.ok || !deleteResult.ok) throw new Error(deleteResult.error || `HTTP ${deleted.status}`);
-    }
-    f.content=result.content;
-    f.pdf_page_count=result.pdf_page_count;
-    f.pdf_page_start=result.pdf_page_start;
-    f.pdf_page_end=result.pdf_page_end;
-    f.pdf_page_selection=result.pdf_page_selection||selection;
-    f.pdf_extraction_version=result.pdf_extraction_version||PDF_EXTRACTION_VERSION;
-    f.status='q'; f.error=''; f.content_out=null; f.live_out={};
-    f.completed_lines={}; f.resume_retranslate=false; f.legacy_out='';
-    f.output_name=null; f.target_language=null; f.retry_queued=false;
-    $('cur').textContent=`已选择 ${pageNumbers.length} / ${total} 页`;
-    render();
-  }catch(error){
-    $('cur').textContent='';
-    await appAlert('设置 PDF 翻译页面失败：' + error.message,'设置失败');
+  const currentSet=new Set(currentPages);
+  const mode=normalizePdfRecognitionMode(f.pdf_recognition_mode);
+  const warmPages=f.pdf_ocr ? pageNumbers.filter(page=>!currentSet.has(page)) : [];
+  await reloadPdfExtraction(f,pageNumbers,mode,warmPages);
+}
+async function applyPdfRecognitionMode(requestedMode){
+  if(jobId || submitting || lineRetranslating || lineSaving || lineEditing) return;
+  const f=files[selectedIdx];
+  if(!f || String(f.source_format||'').toLowerCase()!=='pdf' || !f.source_id) return;
+  const currentMode=normalizePdfRecognitionMode(f.pdf_recognition_mode);
+  const nextMode=normalizePdfRecognitionMode(requestedMode);
+  if(nextMode===currentMode) return;
+  if(pdfHasTranslation(f) && !await appConfirm(
+    `把“${f.name}”的识别模式改为“${pdfRecognitionLabel(nextMode)}”？\n\n当前所选页面会重新读取，现有译文、续译断点和关联磁盘译文会被清除。`,
+    '修改 PDF 识别模式'
+  )){
     updateDetailControls();
+    return;
   }
+  const pages=pdfPageNumbers(f);
+  const warmPages=nextMode==='ocr' ? pages : [];
+  await reloadPdfExtraction(f,pages,nextMode,warmPages);
 }
 $('btnPdfPages').addEventListener('click',openPdfPagePicker);
+$('pdfRecognitionMode').addEventListener('change',event=>applyPdfRecognitionMode(event.target.value));
 $('pdfPageGrid').addEventListener('click',event => {
   const button=event.target.closest('button[data-page]');
   if(!button || !pdfPageDraft) return;
@@ -1852,7 +1909,10 @@ async function saveLineEdit(line){
         source_sha256:f.source_sha256||null, text_eol:f.text_eol||'lf',
         text_bom:!!f.text_bom, pdf_page_count:f.pdf_page_count||null,
         pdf_page_start:f.pdf_page_start||null, pdf_page_end:f.pdf_page_end||null,
-        pdf_page_selection:f.pdf_page_selection||null
+        pdf_page_selection:f.pdf_page_selection||null,
+        pdf_recognition_mode:normalizePdfRecognitionMode(f.pdf_recognition_mode),
+        pdf_extraction_version:f.pdf_extraction_version||PDF_EXTRACTION_VERSION,
+        pdf_ocr:!!f.pdf_ocr
       })
     });
     const result=await response.json().catch(() => ({}));
@@ -1899,7 +1959,8 @@ async function retranslateLine(line){
         source_sha256:f.source_sha256||null, text_eol:f.text_eol||'lf',
         text_bom:!!f.text_bom, pdf_page_count:f.pdf_page_count||null,
         pdf_page_start:f.pdf_page_start||null, pdf_page_end:f.pdf_page_end||null,
-        pdf_page_selection:f.pdf_page_selection||null
+        pdf_page_selection:f.pdf_page_selection||null,
+        pdf_recognition_mode:normalizePdfRecognitionMode(f.pdf_recognition_mode)
       })
     });
     const result=await response.json().catch(() => ({}));
@@ -2067,7 +2128,8 @@ function persistentSnapshot(){
     pdf_page_start:f.pdf_page_start||null, pdf_page_end:f.pdf_page_end||null,
     pdf_page_selection:f.pdf_page_selection||null,
     pdf_extraction_version:f.pdf_extraction_version||null,
-    pdf_ocr:!!f.pdf_ocr}));
+    pdf_ocr:!!f.pdf_ocr,
+    pdf_recognition_mode:normalizePdfRecognitionMode(f.pdf_recognition_mode)}));
 }
 function persist(){
   try{
@@ -2136,7 +2198,8 @@ async function restoreFiles(){
           pdf_page_end:f.pdf_page_end||null,
           pdf_page_selection:f.pdf_page_selection||null,
           pdf_extraction_version:f.pdf_extraction_version||null,
-          pdf_ocr:!!f.pdf_ocr};
+          pdf_ocr:!!f.pdf_ocr,
+          pdf_recognition_mode:normalizePdfRecognitionMode(f.pdf_recognition_mode)};
       });
       if(files.length) render();
     }
@@ -2159,6 +2222,8 @@ async function markOutputsDone(){
         (String(f.source_format||'').toLowerCase()==='pdf'
           ? '&pages=' + encodeURIComponent(
               formatPdfPageSelection(pdfPageNumbers(f), Number(f.pdf_page_count||0)) || 'all'
+            ) + '&recognition_mode=' + encodeURIComponent(
+              normalizePdfRecognitionMode(f.pdf_recognition_mode)
             )
           : ''));
       const source=await sourceResponse.json().catch(() => ({}));
@@ -2172,6 +2237,8 @@ async function markOutputsDone(){
           f.pdf_page_end=source.pdf_page_end;
           f.pdf_page_selection=source.pdf_page_selection||'all';
           f.pdf_extraction_version=source.pdf_extraction_version||PDF_EXTRACTION_VERSION;
+          f.pdf_recognition_mode=normalizePdfRecognitionMode(source.pdf_recognition_mode);
+          f.pdf_ocr=!!source.pdf_ocr;
         }
         if(contentChanged){
           refreshedPdfSources.add(f.name);
@@ -2204,6 +2271,8 @@ async function markOutputsDone(){
         Number(entry.pdf_page_end||entry.pdf_page_count)!==Number(f.pdf_page_end||f.pdf_page_count) ||
         formatPdfPageSelection(pdfPageNumbers(entry), Number(entry.pdf_page_count||0)) !==
           formatPdfPageSelection(pdfPageNumbers(f), Number(f.pdf_page_count||0)) ||
+        normalizePdfRecognitionMode(entry.pdf_recognition_mode)!==
+          normalizePdfRecognitionMode(f.pdf_recognition_mode) ||
         Boolean(entry.pdf_strict_layout)!==Boolean(currentCfg.pdfStrict)
       )) continue;
       const rr = await fetch('/api/output?name=' + encodeURIComponent(outName));
@@ -2339,7 +2408,10 @@ async function submitJob(subFiles, {retranslate=false}={}){
         source_sha256:f.source_sha256||null, text_eol:f.text_eol||'lf',
         text_bom:!!f.text_bom, pdf_page_count:f.pdf_page_count||null,
         pdf_page_start:f.pdf_page_start||null, pdf_page_end:f.pdf_page_end||null,
-        pdf_page_selection:f.pdf_page_selection||null
+        pdf_page_selection:f.pdf_page_selection||null,
+        pdf_recognition_mode:normalizePdfRecognitionMode(f.pdf_recognition_mode),
+        pdf_extraction_version:f.pdf_extraction_version||PDF_EXTRACTION_VERSION,
+        pdf_ocr:!!f.pdf_ocr
       };
       if(Object.keys(resume).length) item.resume_lines=resume;
       if(wantsRetranslate){
@@ -2634,7 +2706,7 @@ async function reconnectJob(){
           source_id:null, source_format:'text', source_sha256:null,
           text_eol:'lf', text_bom:false, pdf_page_count:null,
           pdf_page_start:null, pdf_page_end:null, pdf_page_selection:null,
-          pdf_extraction_version:null};
+          pdf_extraction_version:null, pdf_ocr:false, pdf_recognition_mode:'auto'};
         files.push(file);
       }
       if(typeof source.content === 'string') file.content = source.content;
@@ -2646,6 +2718,10 @@ async function reconnectJob(){
       file.pdf_page_end=source.pdf_page_end||file.pdf_page_end||null;
       file.pdf_page_selection=source.pdf_page_selection||file.pdf_page_selection||null;
       file.pdf_extraction_version=source.pdf_extraction_version||file.pdf_extraction_version||null;
+      file.pdf_recognition_mode=normalizePdfRecognitionMode(
+        source.pdf_recognition_mode||file.pdf_recognition_mode
+      );
+      file.pdf_ocr=source.pdf_ocr===undefined ? !!file.pdf_ocr : !!source.pdf_ocr;
       file.text_eol=source.text_eol||file.text_eol||'lf';
       file.text_bom=source.text_bom===undefined ? !!file.text_bom : !!source.text_bom;
     }

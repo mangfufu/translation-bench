@@ -42,6 +42,7 @@ from document_formats import (
     load_binary_source,
     load_binary_source_path,
     normalize_pdf_page_selection,
+    normalize_pdf_recognition_mode,
     pdf_page_count,
 )
 
@@ -258,6 +259,7 @@ def save_translation_output(
             pdf_page_end=file_info.get("pdf_page_end"),
             pdf_page_selection=file_info.get("pdf_page_selection"),
             pdf_strict_layout=pdf_strict_layout,
+            pdf_recognition_mode=file_info.get("pdf_recognition_mode", "auto"),
         )
         digest = binary_digest(source_data)
     else:
@@ -305,6 +307,9 @@ def save_translation_output(
         )
         metadata["pdf_extraction_version"] = PDF_EXTRACTION_VERSION
         metadata["pdf_strict_layout"] = bool(pdf_strict_layout)
+        metadata["pdf_recognition_mode"] = normalize_pdf_recognition_mode(
+            file_info.get("pdf_recognition_mode")
+        )
     save_output_metadata(metadata)
     return output_name
 
@@ -1873,6 +1878,13 @@ def job_status_snapshot(job_id, requested_full=False):
                     "pdf_page_start": item.get("pdf_page_start"),
                     "pdf_page_end": item.get("pdf_page_end"),
                     "pdf_page_selection": item.get("pdf_page_selection"),
+                    "pdf_recognition_mode": item.get(
+                        "pdf_recognition_mode", "auto"
+                    ),
+                    "pdf_extraction_version": item.get(
+                        "pdf_extraction_version", PDF_EXTRACTION_VERSION
+                    ),
+                    "pdf_ocr": bool(item.get("pdf_ocr", False)),
                     "text_eol": item.get("text_eol", "lf"),
                     "text_bom": bool(item.get("text_bom", False)),
                 }
@@ -2017,6 +2029,9 @@ class Handler(BaseHTTPRequestHandler):
             requested_page_start = query.get("page_start", [None])[0]
             requested_page_end = query.get("page_end", [None])[0]
             requested_page_selection = query.get("pages", [None])[0]
+            recognition_mode = normalize_pdf_recognition_mode(
+                query.get("recognition_mode", ["auto"])[0]
+            )
             try:
                 data = load_cached_source(
                     SOURCE_CACHE_DIR, source_id, source_format, source_sha256
@@ -2038,13 +2053,16 @@ class Handler(BaseHTTPRequestHandler):
                     )
                     page_start = selected_pages[0]
                     page_end = selected_pages[-1]
-                    content = extract_binary_text(
-                        source_format,
+                    extracted_pdf = extract_pdf_translation_data(
                         data,
-                        pdf_page_selection=page_selection,
+                        page_selection=page_selection,
+                        recognition_mode=recognition_mode,
                     )
+                    content = extracted_pdf["content"]
+                    pdf_ocr = bool(extracted_pdf["used_ocr"])
                 else:
                     page_count = page_start = page_end = page_selection = None
+                    pdf_ocr = False
                     content = extract_binary_text(source_format, data)
             except (DocumentFormatError, OSError, ValueError) as exc:
                 self._send_json({"error": str(exc)}, 400)
@@ -2062,6 +2080,8 @@ class Handler(BaseHTTPRequestHandler):
                     "pdf_page_end": page_end,
                     "pdf_page_selection": page_selection,
                     "pdf_extraction_version": PDF_EXTRACTION_VERSION,
+                    "pdf_recognition_mode": recognition_mode,
+                    "pdf_ocr": pdf_ocr,
                 })
             self._send_json(result)
         elif path == "/api/history":
@@ -2085,6 +2105,9 @@ class Handler(BaseHTTPRequestHandler):
                             "pdf_page_selection": meta.get("pdf_page_selection"),
                             "pdf_extraction_version": meta.get("pdf_extraction_version"),
                             "pdf_strict_layout": meta.get("pdf_strict_layout"),
+                            "pdf_recognition_mode": meta.get(
+                                "pdf_recognition_mode", "auto"
+                            ),
                         })
                         files_list.append(entry)
             self._send_json({"files": files_list})
@@ -2338,6 +2361,9 @@ class Handler(BaseHTTPRequestHandler):
                 if content_type == "application/octet-stream":
                     _, query = self._request_parts()
                     name = query.get("name", [""])[0]
+                    pdf_recognition_mode = normalize_pdf_recognition_mode(
+                        query.get("recognition_mode", ["auto"])[0]
+                    )
                     if not name or name != os.path.basename(name):
                         raise DocumentFormatError("导入文件名无效")
                     imported = cache_binary_source_stream(
@@ -2345,6 +2371,7 @@ class Handler(BaseHTTPRequestHandler):
                         name,
                         self.rfile,
                         self.headers.get("Content-Length", ""),
+                        pdf_recognition_mode=pdf_recognition_mode,
                     )
                 else:
                     # 保留旧 JSON 接口，避免已打开的旧页面在刷新前失效。
@@ -2353,6 +2380,9 @@ class Handler(BaseHTTPRequestHandler):
                         raise DocumentFormatError("导入请求无效")
                     name = body.get("name", "")
                     encoded = body.get("data_base64", "")
+                    pdf_recognition_mode = normalize_pdf_recognition_mode(
+                        body.get("pdf_recognition_mode")
+                    )
                     if (
                         not isinstance(name, str)
                         or not name
@@ -2363,7 +2393,9 @@ class Handler(BaseHTTPRequestHandler):
                         data = base64.b64decode(encoded, validate=True)
                     except (ValueError, TypeError) as exc:
                         raise DocumentFormatError("文档数据不是有效的 Base64") from exc
-                    imported = cache_binary_source(SOURCE_CACHE_DIR, name, data)
+                    imported = cache_binary_source(
+                        SOURCE_CACHE_DIR, name, data, pdf_recognition_mode
+                    )
             except (DocumentFormatError, OSError, ValueError, UnicodeError) as exc:
                 self._send_json({"error": str(exc)}, 400)
                 return
@@ -2432,6 +2464,9 @@ class Handler(BaseHTTPRequestHandler):
                         "pdf_page_start": body.get("pdf_page_start"),
                         "pdf_page_end": body.get("pdf_page_end"),
                         "pdf_page_selection": body.get("pdf_page_selection"),
+                        "pdf_recognition_mode": body.get(
+                            "pdf_recognition_mode", "auto"
+                        ),
                         "text_eol": text_eol,
                         "text_bom": text_bom,
                     },
@@ -2500,6 +2535,9 @@ class Handler(BaseHTTPRequestHandler):
                         page_selection=format_pdf_page_selection(
                             selected_pages, count
                         ),
+                        recognition_mode=normalize_pdf_recognition_mode(
+                            body.get("pdf_recognition_mode")
+                        ),
                     )
                     if extracted_pdf["content"] != content:
                         raise DocumentFormatError(
@@ -2539,6 +2577,9 @@ class Handler(BaseHTTPRequestHandler):
                         "pdf_page_start": body.get("pdf_page_start"),
                         "pdf_page_end": body.get("pdf_page_end"),
                         "pdf_page_selection": body.get("pdf_page_selection"),
+                        "pdf_recognition_mode": body.get(
+                            "pdf_recognition_mode", "auto"
+                        ),
                         "text_eol": text_eol,
                         "text_bom": text_bom,
                     },
@@ -2712,6 +2753,9 @@ class Handler(BaseHTTPRequestHandler):
                         file_info.get("source_sha256", ""),
                     )
                     if source_format == "pdf":
+                        recognition_mode = normalize_pdf_recognition_mode(
+                            file_info.get("pdf_recognition_mode")
+                        )
                         count = pdf_page_count(source_data)
                         selected_pages = normalize_pdf_page_selection(
                             count,
@@ -2725,6 +2769,7 @@ class Handler(BaseHTTPRequestHandler):
                         extracted_pdf = extract_pdf_translation_data(
                             source_data,
                             page_selection=page_selection,
+                            recognition_mode=recognition_mode,
                         )
                         expected_content = extracted_pdf["content"]
                         if expected_content != file_info.get("content", ""):
@@ -2735,6 +2780,9 @@ class Handler(BaseHTTPRequestHandler):
                         file_info["pdf_page_start"] = selected_pages[0]
                         file_info["pdf_page_end"] = selected_pages[-1]
                         file_info["pdf_page_selection"] = page_selection
+                        file_info["pdf_recognition_mode"] = recognition_mode
+                        file_info["pdf_extraction_version"] = PDF_EXTRACTION_VERSION
+                        file_info["pdf_ocr"] = bool(extracted_pdf["used_ocr"])
                         file_info["continuation_hints"] = extracted_pdf[
                             "continuation_hints"
                         ]

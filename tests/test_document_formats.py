@@ -21,6 +21,7 @@ from document_formats import (
     format_pdf_page_selection,
     load_binary_source,
     normalize_pdf_page_selection,
+    normalize_pdf_recognition_mode,
 )
 
 
@@ -879,6 +880,45 @@ class DocumentFormatTests(unittest.TestCase):
         with self.assertRaisesRegex(DocumentFormatError, "加密"):
             extract_binary_text("pdf", make_pdf(encrypted=True))
 
+    def test_pdf_recognition_mode_is_normalized(self):
+        self.assertEqual(normalize_pdf_recognition_mode(None), "auto")
+        self.assertEqual(normalize_pdf_recognition_mode("OCR"), "ocr")
+        self.assertEqual(normalize_pdf_recognition_mode("text"), "text")
+        self.assertEqual(normalize_pdf_recognition_mode("unknown"), "auto")
+
+    def test_pdf_recognition_modes_route_text_and_ocr_explicitly(self):
+        source = make_pdf()
+        old_fill = document_formats._pdf_fill_ocr_pages
+        calls = []
+
+        def fake_fill(_data, pages):
+            calls.append([page["page_number"] for page in pages])
+            for page in pages:
+                page["units"] = [{"text": f'OCR page {page["page_number"]}'}]
+                page["geometry_source"] = "ocr"
+
+        document_formats._pdf_fill_ocr_pages = fake_fill
+        try:
+            automatic = document_formats.extract_pdf_translation_data(
+                source, recognition_mode="auto"
+            )
+            text_only = document_formats.extract_pdf_translation_data(
+                source, recognition_mode="text"
+            )
+            forced = document_formats.extract_pdf_translation_data(
+                source, recognition_mode="ocr"
+            )
+        finally:
+            document_formats._pdf_fill_ocr_pages = old_fill
+
+        self.assertFalse(automatic["used_ocr"])
+        self.assertFalse(text_only["used_ocr"])
+        self.assertEqual(automatic["content"], text_only["content"])
+        self.assertEqual(calls, [[1, 2, 3]])
+        self.assertTrue(forced["used_ocr"])
+        self.assertEqual(forced["recognition_mode"], "ocr")
+        self.assertEqual(forced["content"], "OCR page 1\nOCR page 2\nOCR page 3")
+
     def test_pdf_ocr_boxes_filter_isolated_art_letters(self):
         import numpy as np
 
@@ -1429,6 +1469,7 @@ class DocumentFormatTests(unittest.TestCase):
                 self.assertEqual(metadata["pdf_page_end"], 2)
                 self.assertEqual(metadata["pdf_page_selection"], "2")
                 self.assertTrue(metadata["pdf_strict_layout"])
+                self.assertEqual(metadata["pdf_recognition_mode"], "auto")
                 self.assertEqual(
                     metadata["pdf_extraction_version"],
                     document_formats.PDF_EXTRACTION_VERSION,
@@ -1473,6 +1514,7 @@ class DocumentFormatTests(unittest.TestCase):
                 self.assertEqual(imported["pdf_page_start"], 1)
                 self.assertEqual(imported["pdf_page_end"], 3)
                 self.assertEqual(imported["pdf_page_selection"], "all")
+                self.assertEqual(imported["pdf_recognition_mode"], "auto")
                 self.assertEqual(
                     imported["pdf_extraction_version"],
                     document_formats.PDF_EXTRACTION_VERSION,
@@ -1491,6 +1533,8 @@ class DocumentFormatTests(unittest.TestCase):
                 self.assertEqual(ranged["pdf_page_start"], 2)
                 self.assertEqual(ranged["pdf_page_end"], 2)
                 self.assertEqual(ranged["pdf_page_selection"], "2")
+                self.assertEqual(ranged["pdf_recognition_mode"], "auto")
+                self.assertFalse(ranged["pdf_ocr"])
                 self.assertEqual(
                     ranged["pdf_extraction_version"],
                     document_formats.PDF_EXTRACTION_VERSION,

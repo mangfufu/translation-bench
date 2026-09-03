@@ -24,7 +24,8 @@ class DocumentFormatError(ValueError):
 
 
 BINARY_EXTENSIONS = {".docx", ".epub", ".pdf"}
-PDF_EXTRACTION_VERSION = 6
+PDF_EXTRACTION_VERSION = 7
+PDF_RECOGNITION_MODES = {"auto", "text", "ocr"}
 MAX_ZIP_MEMBERS = 5000
 MAX_ZIP_COMPRESSION_RATIO = 1000.0
 MAX_PDF_PAGES = 1000
@@ -56,6 +57,11 @@ def is_binary_document(name_or_format):
     if not value.startswith("."):
         value = "." + value
     return value in BINARY_EXTENSIONS
+
+
+def normalize_pdf_recognition_mode(value):
+    mode = str(value or "auto").strip().lower()
+    return mode if mode in PDF_RECOGNITION_MODES else "auto"
 
 
 def _binary_path(data):
@@ -1352,7 +1358,9 @@ def _pdf_has_text_layer(data):
 
 def _pdf_document_units(
     data, page_start=None, page_end=None, page_selection=None,
+    recognition_mode="auto",
 ):
+    recognition_mode = normalize_pdf_recognition_mode(recognition_mode)
     with _pdf_decode_limits():
         reader = _pdf_reader(data)
         selected_pages = normalize_pdf_page_selection(
@@ -1370,7 +1378,11 @@ def _pdf_document_units(
                 # replacing the text operators would also damage the artwork.
                 # A cropped spread must likewise not be extracted with pypdf,
                 # because it includes the hidden half outside CropBox.
-                page_text = "" if preserve_art_text or visible_crop else _pdf_page_text(page)
+                page_text = (
+                    ""
+                    if recognition_mode == "ocr" or preserve_art_text or visible_crop
+                    else _pdf_page_text(page)
+                )
                 units = [] if not page_text else _pdf_page_units(page, page_text)
                 if units:
                     units = _pdf_units_with_repaired_word_spacing(page, units)
@@ -1392,6 +1404,8 @@ def _pdf_document_units(
     # 这样预览、翻译和回填共享同一组块，不再事后猜测位置。
     advanced_pages = []
     for page_info in pages:
+        if recognition_mode == "ocr":
+            continue
         source_page = reader.pages[page_info["page_number"] - 1]
         width, height = page_info["size"]
         if page_info.get("preserve_art_text"):
@@ -1475,9 +1489,13 @@ def _pdf_document_units(
 
     # 没有文字层的页按页 OCR。已有文字层的页继续走原生提取，避免 OCR
     # 改坏可靠文本；纯插图页识别不到文字时保持空单元并在输出中原样保留。
-    ocr_pages = [
+    ocr_pages = [] if recognition_mode == "text" else [
         page for page in pages
-        if not page["units"] and not page.get("preserve_art_text")
+        if (recognition_mode == "ocr" or not page["units"])
+        and (
+            recognition_mode == "ocr"
+            or not page.get("preserve_art_text")
+        )
     ]
     if ocr_pages:
         _pdf_fill_ocr_pages(data, ocr_pages)
@@ -1602,18 +1620,27 @@ def _pdf_continuation_hints(pages):
 
 def extract_pdf_translation_data(
     data, page_start=None, page_end=None, page_selection=None,
+    recognition_mode="auto",
 ):
     """Extract PDF text plus internal, line-aligned continuation hints."""
-    pages = _pdf_document_units(data, page_start, page_end, page_selection)
+    recognition_mode = normalize_pdf_recognition_mode(recognition_mode)
+    pages = _pdf_document_units(
+        data, page_start, page_end, page_selection, recognition_mode
+    )
     return {
         "content": _pdf_units_text(pages),
         "continuation_hints": _pdf_continuation_hints(pages),
+        "used_ocr": any(page.get("geometry_source") == "ocr" for page in pages),
+        "recognition_mode": recognition_mode,
     }
 
 
-def _extract_pdf(data, page_start=None, page_end=None, page_selection=None):
+def _extract_pdf(
+    data, page_start=None, page_end=None, page_selection=None,
+    recognition_mode="auto",
+):
     return extract_pdf_translation_data(
-        data, page_start, page_end, page_selection
+        data, page_start, page_end, page_selection, recognition_mode
     )["content"]
 
 
@@ -3039,8 +3066,11 @@ def _build_pdf(
     page_end=None,
     page_selection=None,
     strict_layout=True,
+    recognition_mode="auto",
 ):
-    pages = _pdf_document_units(data, page_start, page_end, page_selection)
+    pages = _pdf_document_units(
+        data, page_start, page_end, page_selection, recognition_mode
+    )
     translations = str(translated_text).split("\n")
     source_units = [unit for page in pages for unit in page["units"]]
     if len(translations) < len(source_units):
@@ -3198,6 +3228,7 @@ def extract_binary_text(
     pdf_page_start=None,
     pdf_page_end=None,
     pdf_page_selection=None,
+    pdf_recognition_mode="auto",
 ):
     with FORMAT_LOCK:
         fmt = str(document_format or "").lower().lstrip(".")
@@ -3207,7 +3238,8 @@ def extract_binary_text(
             return _extract_epub(data)
         if fmt == "pdf":
             return _extract_pdf(
-                data, pdf_page_start, pdf_page_end, pdf_page_selection
+                data, pdf_page_start, pdf_page_end, pdf_page_selection,
+                pdf_recognition_mode,
             )
         raise DocumentFormatError("不支持的二进制文档格式")
 
@@ -3222,6 +3254,7 @@ def build_binary_output(
     pdf_page_end=None,
     pdf_page_selection=None,
     pdf_strict_layout=True,
+    pdf_recognition_mode="auto",
 ):
     with FORMAT_LOCK:
         fmt = str(document_format or "").lower().lstrip(".")
@@ -3240,6 +3273,7 @@ def build_binary_output(
                     page_end=pdf_page_end,
                     page_selection=pdf_page_selection,
                     strict_layout=bool(pdf_strict_layout),
+                    recognition_mode=pdf_recognition_mode,
                 )
             except DocumentFormatError:
                 raise
@@ -3255,19 +3289,30 @@ def _safe_source_id(source_id):
     return value
 
 
-def _cached_source_result(destination, source_id, extension, digest):
+def _cached_source_result(
+    destination, source_id, extension, digest, pdf_recognition_mode="auto",
+):
     with FORMAT_LOCK:
         pdf_page_count_value = None
         pdf_page_selection = None
         pdf_ocr = False
         if extension == ".pdf":
+            pdf_recognition_mode = normalize_pdf_recognition_mode(
+                pdf_recognition_mode
+            )
             pdf_page_count_value = pdf_page_count(destination)
-            pdf_ocr = not _pdf_has_text_layer(destination)
+            has_text_layer = _pdf_has_text_layer(destination)
+            pdf_ocr = (
+                pdf_recognition_mode == "ocr"
+                or (pdf_recognition_mode == "auto" and not has_text_layer)
+            )
             # 扫描 PDF 先识别一页，让导入尽快完成并立即交给用户多选页；
             # 普通文字层 PDF 保持原有的默认全文行为。
             pdf_page_selection = "1" if pdf_ocr else "all"
             pages = _pdf_document_units(
-                destination, page_selection=pdf_page_selection
+                destination,
+                page_selection=pdf_page_selection,
+                recognition_mode=pdf_recognition_mode,
             )
             content = _pdf_units_text(pages)
         else:
@@ -3289,6 +3334,7 @@ def _cached_source_result(destination, source_id, extension, digest):
             "pdf_page_selection": pdf_page_selection,
             "pdf_extraction_version": PDF_EXTRACTION_VERSION,
             "pdf_ocr": pdf_ocr,
+            "pdf_recognition_mode": pdf_recognition_mode,
         })
     return result
 
@@ -3301,7 +3347,9 @@ def _remove_cached_source_files(destination):
             os.remove(candidate)
 
 
-def cache_binary_source(cache_dir, filename, data):
+def cache_binary_source(
+    cache_dir, filename, data, pdf_recognition_mode="auto",
+):
     extension = document_extension(filename)
     if extension not in BINARY_EXTENSIONS:
         raise DocumentFormatError("不支持的二进制文档格式")
@@ -3316,7 +3364,8 @@ def cache_binary_source(cache_dir, filename, data):
             handle.write(data)
         os.replace(temporary, destination)
         return _cached_source_result(
-            destination, source_id, extension, binary_digest(data)
+            destination, source_id, extension, binary_digest(data),
+            pdf_recognition_mode,
         )
     except Exception:
         _remove_cached_source_files(destination)
@@ -3328,6 +3377,7 @@ def cache_binary_source(cache_dir, filename, data):
 
 def cache_binary_source_stream(
     cache_dir, filename, source_stream, content_length, chunk_size=1024 * 1024,
+    pdf_recognition_mode="auto",
 ):
     """把 HTTP 请求体分块写入内部缓存，不在浏览器或 Python 中复制整份文件。"""
     extension = document_extension(filename)
@@ -3357,7 +3407,8 @@ def cache_binary_source_stream(
                 remaining -= len(chunk)
         os.replace(temporary, destination)
         return _cached_source_result(
-            destination, source_id, extension, digest.hexdigest()
+            destination, source_id, extension, digest.hexdigest(),
+            pdf_recognition_mode,
         )
     except Exception:
         _remove_cached_source_files(destination)
