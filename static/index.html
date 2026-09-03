@@ -688,7 +688,7 @@ $('drop').addEventListener('drop', e => addFiles([...e.dataTransfer.files]));
 
 const TEXT_DOCUMENT_EXTENSIONS=['.md','.txt','.text','.markdown','.srt','.vtt'];
 const BINARY_DOCUMENT_EXTENSIONS=['.docx','.epub','.pdf'];
-const PDF_EXTRACTION_VERSION=5;
+const PDF_EXTRACTION_VERSION=6;
 function pdfPageNumbers(file){
   const total=Math.max(0,Number(file?.pdf_page_count||0));
   if(!total) return [];
@@ -754,19 +754,11 @@ async function importTextFile(file){
     pdf_page_count:null,pdf_page_start:null,pdf_page_end:null,pdf_page_selection:null,
     pdf_extraction_version:null};
 }
-function arrayBufferToBase64(buffer){
-  const bytes=new Uint8Array(buffer), chunks=[];
-  for(let offset=0;offset<bytes.length;offset+=0x8000){
-    chunks.push(String.fromCharCode(...bytes.subarray(offset,offset+0x8000)));
-  }
-  return btoa(chunks.join(''));
-}
 async function importBinaryFile(file){
-  $('cur').textContent='正在导入：' + file.name;
-  const encoded=arrayBufferToBase64(await file.arrayBuffer());
-  const response=await fetch('/api/import', {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({name:file.name,data_base64:encoded})
+  $('cur').textContent='正在导入：' + file.name + ' · 大文件会直接写入磁盘';
+  const response=await fetch('/api/import?name=' + encodeURIComponent(file.name), {
+    method:'POST', headers:{'Content-Type':'application/octet-stream'},
+    body:file
   });
   const result=await response.json().catch(() => ({}));
   if(!response.ok || !result.ok) throw new Error(result.error || `HTTP ${response.status}`);
@@ -781,10 +773,11 @@ async function releaseSource(file){
 }
 
 async function addFiles(list){
+  let scannedPdfIndex=-1;
   for(const f of list){
     const extension=fileExtension(f.name);
     if(!TEXT_DOCUMENT_EXTENSIONS.includes(extension) && !BINARY_DOCUMENT_EXTENSIONS.includes(extension)){
-      await appAlert(`暂不支持“${f.name}”。\n\n当前支持 Markdown、纯文本、SRT、WebVTT、DOCX、EPUB 和带文字层的 PDF。`,'不支持的格式');
+      await appAlert(`暂不支持“${f.name}”。\n\n当前支持 Markdown、纯文本、SRT、WebVTT、DOCX、EPUB 和 PDF（含扫描件 OCR）。`,'不支持的格式');
       continue;
     }
     const existing = files.find(x => x.name.toLocaleLowerCase() === f.name.toLocaleLowerCase());
@@ -840,6 +833,7 @@ async function addFiles(list){
       existing.pdf_page_end=imported.pdf_page_end||null;
       existing.pdf_page_selection=imported.pdf_page_selection||null;
       existing.pdf_extraction_version=imported.pdf_extraction_version||null;
+      existing.pdf_ocr=!!imported.pdf_ocr;
       existing.text_eol=imported.text_eol||'lf';
       existing.text_bom=!!imported.text_bom;
       if(sourceChanged){
@@ -848,6 +842,7 @@ async function addFiles(list){
         existing.legacy_out=''; existing.output_name=null; existing.target_language=null;
         existing.priority=false; existing.retry_queued=false;
       }
+      if(imported.pdf_ocr) scannedPdfIndex=files.indexOf(existing);
       continue;
     }
     files.push({name:f.name, content, status:'q', error:'', content_out:null,
@@ -858,12 +853,19 @@ async function addFiles(list){
       text_bom:!!imported.text_bom, pdf_page_count:imported.pdf_page_count||null,
       pdf_page_start:imported.pdf_page_start||null, pdf_page_end:imported.pdf_page_end||null,
       pdf_page_selection:imported.pdf_page_selection||null,
-      pdf_extraction_version:imported.pdf_extraction_version||null});
+      pdf_extraction_version:imported.pdf_extraction_version||null,
+      pdf_ocr:!!imported.pdf_ocr});
+    if(imported.pdf_ocr) scannedPdfIndex=files.length-1;
   }
   $('cur').textContent='';
   if(selectedIdx < 0 && files.length) selectedIdx = 0;
+  if(scannedPdfIndex>=0) selectedIdx=scannedPdfIndex;
   render();
   markOutputsDone();   // 标记后台已翻译过的文件
+  if(scannedPdfIndex>=0 && !jobId && !submitting){
+    $('cur').textContent='扫描 PDF 已完成第 1 页 OCR，请选择需要翻译的页面';
+    setTimeout(openPdfPagePicker,0);
+  }
 }
 $('btnClear').addEventListener('click', async () => {
   if(!files.length || jobId || submitting || lineRetranslating || lineSaving || lineEditing) return;
@@ -1309,6 +1311,22 @@ async function applyPdfPageSelection(pageNumbers){
   $('btnPdfPages').disabled=true;
   $('cur').textContent=`正在读取所选 ${pageNumbers.length} 页：${f.name}`;
   try{
+    if(f.pdf_ocr){
+      const currentPages=new Set(pdfPageNumbers(f));
+      const addedPages=pageNumbers.filter(page=>!currentPages.has(page));
+      for(let index=0;index<addedPages.length;index++){
+        const page=addedPages[index];
+        $('cur').textContent=`正在 OCR 第 ${page} 页 · ${index+1}/${addedPages.length}`;
+        const pageResponse=await fetch('/api/source?id=' + encodeURIComponent(f.source_id) +
+          '&format=pdf&sha256=' + encodeURIComponent(f.source_sha256||'') +
+          '&pages=' + page);
+        const pageResult=await pageResponse.json().catch(() => ({}));
+        if(!pageResponse.ok || !pageResult.ok){
+          throw new Error(pageResult.error || `第 ${page} 页 OCR 失败（HTTP ${pageResponse.status}）`);
+        }
+      }
+      $('cur').textContent=`正在合并所选 ${pageNumbers.length} 页：${f.name}`;
+    }
     const response=await fetch('/api/source?id=' + encodeURIComponent(f.source_id) +
       '&format=pdf&sha256=' + encodeURIComponent(f.source_sha256||'') +
       '&pages=' + encodeURIComponent(selection));
@@ -1684,7 +1702,8 @@ function persistentSnapshot(){
     text_eol:f.text_eol||'lf', text_bom:!!f.text_bom, pdf_page_count:f.pdf_page_count||null,
     pdf_page_start:f.pdf_page_start||null, pdf_page_end:f.pdf_page_end||null,
     pdf_page_selection:f.pdf_page_selection||null,
-    pdf_extraction_version:f.pdf_extraction_version||null}));
+    pdf_extraction_version:f.pdf_extraction_version||null,
+    pdf_ocr:!!f.pdf_ocr}));
 }
 function persist(){
   try{
@@ -1752,7 +1771,8 @@ async function restoreFiles(){
           pdf_page_count:f.pdf_page_count||null, pdf_page_start:f.pdf_page_start||null,
           pdf_page_end:f.pdf_page_end||null,
           pdf_page_selection:f.pdf_page_selection||null,
-          pdf_extraction_version:f.pdf_extraction_version||null};
+          pdf_extraction_version:f.pdf_extraction_version||null,
+          pdf_ocr:!!f.pdf_ocr};
       });
       if(files.length) render();
     }

@@ -32,6 +32,7 @@ from document_formats import (
     binary_digest,
     build_binary_output,
     cache_binary_source,
+    cache_binary_source_stream,
     delete_binary_source,
     document_extension,
     extract_binary_text,
@@ -39,6 +40,7 @@ from document_formats import (
     format_pdf_page_selection,
     is_binary_document,
     load_binary_source,
+    load_binary_source_path,
     normalize_pdf_page_selection,
     pdf_page_count,
 )
@@ -61,6 +63,15 @@ JOB_TTL_SECONDS = 24 * 60 * 60
 MAX_FINISHED_JOBS = 50
 MAX_FINISHED_JOB_TEXT_CHARS = 32 * 1024 * 1024
 SSE_QUEUE_MAX_EVENTS = 256
+
+
+def load_cached_source(cache_dir, source_id, source_format="", source_sha256=""):
+    """PDF 保持为磁盘路径，避免大文件在每个接口中整体复制进内存。"""
+    if str(source_format or "").lower().lstrip(".") == "pdf":
+        return load_binary_source_path(
+            cache_dir, source_id, source_format, source_sha256
+        )
+    return load_binary_source(cache_dir, source_id, source_format, source_sha256)
 
 
 def next_model_log_id():
@@ -231,7 +242,7 @@ def save_translation_output(
     if is_binary_document(source_format) and extension != "." + source_format:
         raise DocumentFormatError("文件扩展名与二进制原文格式不一致")
     if is_binary_document(source_format):
-        source_data = load_binary_source(
+        source_data = load_cached_source(
             SOURCE_CACHE_DIR,
             file_info.get("source_id"),
             source_format,
@@ -1817,8 +1828,15 @@ class Handler(BaseHTTPRequestHandler):
                 return reject("cross-origin request rejected")
 
         if mutating and self.command == "POST":
-            content_type = self.headers.get("Content-Type", "")
-            if content_type.split(";", 1)[0].strip().lower() != "application/json":
+            content_type = (
+                self.headers.get("Content-Type", "")
+                .split(";", 1)[0].strip().lower()
+            )
+            request_path = unquote(urlsplit(self.path).path)
+            allowed_types = {"application/json"}
+            if request_path == "/api/import":
+                allowed_types.add("application/octet-stream")
+            if content_type not in allowed_types:
                 return reject("application/json required", 415)
         return True
 
@@ -1869,7 +1887,7 @@ class Handler(BaseHTTPRequestHandler):
             requested_page_end = query.get("page_end", [None])[0]
             requested_page_selection = query.get("pages", [None])[0]
             try:
-                data = load_binary_source(
+                data = load_cached_source(
                     SOURCE_CACHE_DIR, source_id, source_format, source_sha256
                 )
             except (DocumentFormatError, OSError) as exc:
@@ -2168,18 +2186,39 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/import":
             try:
-                body = self._read_body()
-                if not isinstance(body, dict):
-                    raise DocumentFormatError("导入请求无效")
-                name = body.get("name", "")
-                encoded = body.get("data_base64", "")
-                if not isinstance(name, str) or not name or not isinstance(encoded, str):
-                    raise DocumentFormatError("导入请求无效")
-                try:
-                    data = base64.b64decode(encoded, validate=True)
-                except (ValueError, TypeError) as exc:
-                    raise DocumentFormatError("文档数据不是有效的 Base64") from exc
-                imported = cache_binary_source(SOURCE_CACHE_DIR, name, data)
+                content_type = (
+                    self.headers.get("Content-Type", "")
+                    .split(";", 1)[0].strip().lower()
+                )
+                if content_type == "application/octet-stream":
+                    _, query = self._request_parts()
+                    name = query.get("name", [""])[0]
+                    if not name or name != os.path.basename(name):
+                        raise DocumentFormatError("导入文件名无效")
+                    imported = cache_binary_source_stream(
+                        SOURCE_CACHE_DIR,
+                        name,
+                        self.rfile,
+                        self.headers.get("Content-Length", ""),
+                    )
+                else:
+                    # 保留旧 JSON 接口，避免已打开的旧页面在刷新前失效。
+                    body = self._read_body()
+                    if not isinstance(body, dict):
+                        raise DocumentFormatError("导入请求无效")
+                    name = body.get("name", "")
+                    encoded = body.get("data_base64", "")
+                    if (
+                        not isinstance(name, str)
+                        or not name
+                        or not isinstance(encoded, str)
+                    ):
+                        raise DocumentFormatError("导入请求无效")
+                    try:
+                        data = base64.b64decode(encoded, validate=True)
+                    except (ValueError, TypeError) as exc:
+                        raise DocumentFormatError("文档数据不是有效的 Base64") from exc
+                    imported = cache_binary_source(SOURCE_CACHE_DIR, name, data)
             except (DocumentFormatError, OSError, ValueError, UnicodeError) as exc:
                 self._send_json({"error": str(exc)}, 400)
                 return
@@ -2301,7 +2340,7 @@ class Handler(BaseHTTPRequestHandler):
             continuation_hints = None
             if str(source_format).lower().lstrip(".") == "pdf":
                 try:
-                    source_data = load_binary_source(
+                    source_data = load_cached_source(
                         SOURCE_CACHE_DIR, source_id, "pdf", source_sha256
                     )
                     count = pdf_page_count(source_data)
@@ -2471,7 +2510,7 @@ class Handler(BaseHTTPRequestHandler):
                         raise DocumentFormatError(
                             f"{file_info['name']} 缺少二进制原文，请重新添加文件"
                         )
-                    source_data = load_binary_source(
+                    source_data = load_cached_source(
                         SOURCE_CACHE_DIR,
                         file_info.get("source_id"),
                         source_format,

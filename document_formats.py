@@ -2,8 +2,10 @@
 
 import contextlib
 import copy
+import gc
 import hashlib
 import io
+import json
 import os
 import posixpath
 import re
@@ -22,11 +24,14 @@ class DocumentFormatError(ValueError):
 
 
 BINARY_EXTENSIONS = {".docx", ".epub", ".pdf"}
-PDF_EXTRACTION_VERSION = 5
+PDF_EXTRACTION_VERSION = 6
 MAX_ZIP_MEMBERS = 5000
 MAX_ZIP_COMPRESSION_RATIO = 1000.0
 MAX_PDF_PAGES = 1000
 PDF_STRICT_MIN_FONT_SIZE = 1.0
+PDF_OCR_CACHE_VERSION = 2
+PDF_OCR_MAX_IMAGE_DIMENSION = 1800
+PDF_OCR_MIN_SCORE = 0.45
 
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 XML_NS = "http://www.w3.org/XML/1998/namespace"
@@ -53,8 +58,29 @@ def is_binary_document(name_or_format):
     return value in BINARY_EXTENSIONS
 
 
+def _binary_path(data):
+    if isinstance(data, os.PathLike):
+        return os.fspath(data)
+    if isinstance(data, str):
+        return data
+    return None
+
+
 def binary_digest(data):
-    return hashlib.sha256(data).hexdigest()
+    path = _binary_path(data)
+    if path is None:
+        return hashlib.sha256(data).hexdigest()
+    digest = hashlib.sha256()
+    try:
+        with open(path, "rb") as handle:
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+    except OSError as exc:
+        raise DocumentFormatError("无法读取二进制原文缓存") from exc
+    return digest.hexdigest()
 
 
 def _read_zip_member(archive, name):
@@ -72,13 +98,21 @@ def _read_zip_member(archive, name):
 
 
 def _validated_zip(data, expected_extension):
-    if not isinstance(data, (bytes, bytearray)):
+    path = _binary_path(data)
+    if path is None and not isinstance(data, (bytes, bytearray)):
         raise DocumentFormatError("文档数据无效")
-    if not data:
+    if path is None and not data:
         raise DocumentFormatError("文档为空")
     try:
-        archive = zipfile.ZipFile(io.BytesIO(data), "r")
+        if path is not None:
+            if not os.path.isfile(path) or os.path.getsize(path) <= 0:
+                raise DocumentFormatError("文档为空")
+            archive = zipfile.ZipFile(path, "r")
+        else:
+            archive = zipfile.ZipFile(io.BytesIO(data), "r")
         members = archive.infolist()
+    except DocumentFormatError:
+        raise
     except (OSError, zipfile.BadZipFile) as exc:
         raise DocumentFormatError("文件不是有效的 ZIP 文档容器") from exc
     if len(members) > MAX_ZIP_MEMBERS:
@@ -580,9 +614,12 @@ def _repack_zip(archive, replacements, epub=False):
 
 def _pdf_reader(data):
     """校验 PDF 容器；密码文件必须由用户先解密。"""
-    if not isinstance(data, (bytes, bytearray)):
+    path = _binary_path(data)
+    if path is None and not isinstance(data, (bytes, bytearray)):
         raise DocumentFormatError("PDF 数据无效")
-    if not data:
+    if path is None and not data:
+        raise DocumentFormatError("PDF 为空")
+    if path is not None and (not os.path.isfile(path) or os.path.getsize(path) <= 0):
         raise DocumentFormatError("PDF 为空")
     try:
         from pypdf import PdfReader
@@ -591,7 +628,8 @@ def _pdf_reader(data):
             "PDF 支持尚未安装，请先运行: py -3 -m pip install -r requirements.txt"
         ) from exc
     try:
-        reader = PdfReader(io.BytesIO(bytes(data)), strict=False)
+        source = path if path is not None else io.BytesIO(bytes(data))
+        reader = PdfReader(source, strict=False)
         if reader.is_encrypted:
             raise DocumentFormatError("暂不支持加密 PDF，请先解除密码保护")
         page_count = len(reader.pages)
@@ -867,7 +905,9 @@ def _pdf_page_size(page):
         width, height, rotation = 612.0, 792.0, 0
     if rotation in {90, 270}:
         width, height = height, width
-    if not (216 <= width <= 2000 and 216 <= height <= 2000):
+    # 扫描 PDF 常直接用图片像素作为 MediaBox，尺寸会明显大于普通纸张
+    # 的 72dpi 点数。只拒绝明显损坏的极端值，不能把合法扫描页改成 Letter。
+    if not (36 <= width <= 20000 and 36 <= height <= 20000):
         return 612.0, 792.0
     return width, height
 
@@ -979,6 +1019,337 @@ def format_pdf_page_selection(page_numbers, page_count):
     return ",".join(ranges)
 
 
+_PDF_OCR_ENGINE = None
+
+
+def _pdf_ocr_engine():
+    global _PDF_OCR_ENGINE
+    if _PDF_OCR_ENGINE is not None:
+        return _PDF_OCR_ENGINE
+    try:
+        from rapidocr import RapidOCR
+    except ImportError as exc:
+        raise DocumentFormatError(
+            "扫描 PDF 需要 OCR，请先运行: py -3 -m pip install -r requirements.txt"
+        ) from exc
+    try:
+        _PDF_OCR_ENGINE = RapidOCR()
+    except Exception as exc:
+        raise DocumentFormatError("无法初始化 PDF OCR 引擎") from exc
+    return _PDF_OCR_ENGINE
+
+
+def _pdf_ocr_cache_path(data):
+    path = _binary_path(data)
+    # OCR sidecar 只属于应用内部随机命名的原文缓存，绝不在用户原文件旁
+    # 创建隐藏数据。
+    if not path or not re.fullmatch(r"[0-9a-f]{32}\.pdf", os.path.basename(path)):
+        return None
+    return path + ".ocr.json"
+
+
+def _pdf_load_ocr_cache(data):
+    source_path = _binary_path(data)
+    cache_path = _pdf_ocr_cache_path(data)
+    if not source_path or not cache_path:
+        return {"pages": {}}
+    try:
+        stat = os.stat(source_path)
+        with open(cache_path, "r", encoding="utf-8") as handle:
+            cached = json.load(handle)
+        if (
+            not isinstance(cached, dict)
+            or cached.get("version") != PDF_OCR_CACHE_VERSION
+            or cached.get("source_size") != stat.st_size
+            or cached.get("source_mtime_ns") != stat.st_mtime_ns
+            or not isinstance(cached.get("pages"), dict)
+        ):
+            return {"pages": {}}
+        return cached
+    except (OSError, ValueError, TypeError):
+        return {"pages": {}}
+
+
+def _pdf_save_ocr_cache(data, cache):
+    source_path = _binary_path(data)
+    cache_path = _pdf_ocr_cache_path(data)
+    if not source_path or not cache_path:
+        return
+    try:
+        stat = os.stat(source_path)
+        payload = {
+            "version": PDF_OCR_CACHE_VERSION,
+            "source_size": stat.st_size,
+            "source_mtime_ns": stat.st_mtime_ns,
+            "pages": cache.get("pages", {}),
+        }
+        temporary = cache_path + ".tmp"
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
+        os.replace(temporary, cache_path)
+    except OSError:
+        # OCR 结果本身仍可使用；缓存失败不应让本次翻译失败。
+        with contextlib.suppress(OSError):
+            os.remove(cache_path + ".tmp")
+
+
+def _pdf_ocr_background_color(image, left, top, right, bottom):
+    """从文字框边缘估算底色，避免用固定白块破坏彩色扫描页。"""
+    try:
+        import numpy as np
+
+        image_height, image_width = image.shape[:2]
+        x0 = max(0, min(image_width - 1, int(left)))
+        x1 = max(x0 + 1, min(image_width, int(right) + 1))
+        y0 = max(0, min(image_height - 1, int(top)))
+        y1 = max(y0 + 1, min(image_height, int(bottom) + 1))
+        pad = max(2, min(12, (y1 - y0) // 3))
+        samples = []
+        if y0 > 0:
+            samples.append(image[max(0, y0 - pad):y0, x0:x1])
+        if y1 < image_height:
+            samples.append(image[y1:min(image_height, y1 + pad), x0:x1])
+        if x0 > 0:
+            samples.append(image[y0:y1, max(0, x0 - pad):x0])
+        if x1 < image_width:
+            samples.append(image[y0:y1, x1:min(image_width, x1 + pad)])
+        pixels = [sample.reshape(-1, sample.shape[-1]) for sample in samples if sample.size]
+        if not pixels:
+            pixels = [image[y0:y1, x0:x1].reshape(-1, image.shape[-1])]
+        median = np.median(np.concatenate(pixels, axis=0), axis=0)
+        return tuple(round(float(component) / 255.0, 5) for component in median[:3])
+    except Exception:
+        return (1.0, 1.0, 1.0)
+
+
+def _pdf_ocr_units_from_result(result, image, page_width, page_height):
+    boxes = getattr(result, "boxes", None)
+    texts = getattr(result, "txts", None)
+    scores = getattr(result, "scores", None)
+    if boxes is None or texts is None:
+        return []
+    if scores is None:
+        scores = [1.0] * len(texts)
+    image_height, image_width = image.shape[:2]
+    raw_lines = []
+    for polygon, raw_text, score in zip(boxes, texts, scores):
+        text = _normal_text(str(raw_text or ""))
+        compact = re.sub(r"\s+", "", text)
+        try:
+            confidence = float(score)
+            xs = [float(point[0]) for point in polygon]
+            ys = [float(point[1]) for point in polygon]
+        except (TypeError, ValueError, IndexError):
+            continue
+        # 孤立艺术字母通常来自封面、徽标或装饰，不作为翻译单元。
+        if (
+            confidence < PDF_OCR_MIN_SCORE
+            or not compact
+            or (len(compact) == 1 and compact.isalpha())
+            or not re.search(r"[A-Za-z\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]", compact)
+        ):
+            continue
+        pixel_left, pixel_right = min(xs), max(xs)
+        pixel_top, pixel_bottom = min(ys), max(ys)
+        if (
+            pixel_right - pixel_left < 2
+            or pixel_bottom - pixel_top < 2
+            or pixel_bottom - pixel_top > (pixel_right - pixel_left) * 1.8
+        ):
+            continue
+        raw_lines.append({
+            "text": text,
+            "x0": max(0.0, pixel_left / image_width * page_width),
+            "x1": min(page_width, pixel_right / image_width * page_width),
+            "top": max(0.0, pixel_top / image_height * page_height),
+            "bottom": min(page_height, pixel_bottom / image_height * page_height),
+            "pixel_bounds": [pixel_left, pixel_top, pixel_right, pixel_bottom],
+            "confidence": confidence,
+        })
+    if not raw_lines:
+        return []
+
+    ordered = _pdfplumber_order_boxes(raw_lines, page_width, page_height)
+    groups = []
+    for line in ordered:
+        reading = line.get("_translation_reading") or {}
+        previous = groups[-1] if groups else None
+        previous_reading = previous.get("reading") if previous else {}
+        gap = (
+            float(line["top"]) - float(previous["bottom"])
+            if previous else page_height
+        )
+        line_height = max(1.0, float(line["bottom"]) - float(line["top"]))
+        same_flow = bool(previous) and (
+            reading.get("region") == previous_reading.get("region")
+            and reading.get("column") == previous_reading.get("column")
+            and gap <= max(line_height * 1.35, page_height * 0.012)
+            and abs(float(line["x0"]) - float(previous["x0"])) <= page_width * 0.06
+            and not _pdf_terminal_line(previous["text"])
+            and not _pdf_bullet_like(line["text"])
+            and not _pdf_heading_like(line["text"])
+        )
+        if same_flow:
+            if previous["text"].endswith("-") and line["text"][:1].isalnum():
+                previous["text"] = previous["text"][:-1] + line["text"]
+            else:
+                previous["text"] += " " + line["text"]
+            previous["x0"] = min(previous["x0"], line["x0"])
+            previous["x1"] = max(previous["x1"], line["x1"])
+            previous["top"] = min(previous["top"], line["top"])
+            previous["bottom"] = max(previous["bottom"], line["bottom"])
+            bounds = previous["pixel_bounds"]
+            current = line["pixel_bounds"]
+            previous["pixel_bounds"] = [
+                min(bounds[0], current[0]), min(bounds[1], current[1]),
+                max(bounds[2], current[2]), max(bounds[3], current[3]),
+            ]
+            previous["erase_pixel_bounds"].append(list(current))
+            continue
+        groups.append({
+            "text": line["text"],
+            "x0": line["x0"],
+            "x1": line["x1"],
+            "top": line["top"],
+            "bottom": line["bottom"],
+            "pixel_bounds": list(line["pixel_bounds"]),
+            "erase_pixel_bounds": [list(line["pixel_bounds"])],
+            "reading": dict(reading),
+        })
+
+    # 合并后重新计算区域/栏位中的位置，供跨栏续句判断使用。
+    groups = _pdfplumber_order_boxes(groups, page_width, page_height)
+    units = []
+    for group in groups:
+        pixel_left, pixel_top, pixel_right, pixel_bottom = group["pixel_bounds"]
+        erase_boxes = []
+        backgrounds = []
+        for erase_left, erase_top, erase_right, erase_bottom in group["erase_pixel_bounds"]:
+            background = _pdf_ocr_background_color(
+                image, erase_left, erase_top, erase_right, erase_bottom
+            )
+            backgrounds.append(background)
+            erase_boxes.append({
+                "left": max(0.0, erase_left / image_width * page_width),
+                "right": min(page_width, erase_right / image_width * page_width),
+                "top": min(page_height, page_height - erase_top / image_height * page_height),
+                "bottom": max(0.0, page_height - erase_bottom / image_height * page_height),
+                "color": background,
+            })
+        background = backgrounds[0] if backgrounds else (1.0, 1.0, 1.0)
+        luminance = 0.2126 * background[0] + 0.7152 * background[1] + 0.0722 * background[2]
+        font_size = max(
+            5.5,
+            min(72.0, (float(group["bottom"]) - float(group["top"])) * 0.72),
+        )
+        units.append({
+            "text": _normal_text(group["text"]),
+            "heading": _pdf_heading_like(group["text"]),
+            "box": {
+                "left": max(0.0, float(group["x0"])),
+                "right": min(page_width, float(group["x1"])),
+                "top": min(page_height, page_height - float(group["top"])),
+                "bottom": max(0.0, page_height - float(group["bottom"])),
+                "font_size": font_size,
+                "color": (0.06, 0.06, 0.06) if luminance >= 0.55 else (0.96, 0.96, 0.96),
+                "erase_boxes": erase_boxes,
+            },
+            "reading": dict(group.get("_translation_reading") or {}),
+            "ocr": True,
+        })
+    return [unit for unit in units if unit["text"]]
+
+
+def _pdf_fill_ocr_pages(data, page_infos):
+    targets = [page for page in page_infos if not page.get("units")]
+    if not targets:
+        return
+    cache = _pdf_load_ocr_cache(data)
+    cached_pages = cache.setdefault("pages", {})
+    missing = []
+    for page_info in targets:
+        cached = cached_pages.get(str(page_info["page_number"]))
+        if isinstance(cached, list):
+            page_info["units"] = copy.deepcopy(cached)
+            page_info["geometry_source"] = "ocr"
+            page_info["ocr"] = True
+        else:
+            missing.append(page_info)
+    if not missing:
+        return
+
+    try:
+        import numpy as np
+        import pymupdf
+    except ImportError as exc:
+        raise DocumentFormatError(
+            "扫描 PDF 需要 OCR，请先运行: py -3 -m pip install -r requirements.txt"
+        ) from exc
+    path = _binary_path(data)
+    try:
+        document = (
+            pymupdf.open(path)
+            if path is not None
+            else pymupdf.open(stream=bytes(data), filetype="pdf")
+        )
+    except Exception as exc:
+        raise DocumentFormatError("无法为扫描 PDF 打开 OCR 页面") from exc
+    engine = _pdf_ocr_engine()
+    try:
+        for page_info in missing:
+            page_number = page_info["page_number"]
+            image = pixmap = result = None
+            try:
+                source_page = document[page_number - 1]
+                page_width, page_height = page_info["size"]
+                scale = min(
+                    3.0,
+                    PDF_OCR_MAX_IMAGE_DIMENSION / max(page_width, page_height, 1.0),
+                )
+                pixmap = source_page.get_pixmap(
+                    matrix=pymupdf.Matrix(scale, scale),
+                    colorspace=pymupdf.csRGB,
+                    alpha=False,
+                )
+                image = np.frombuffer(pixmap.samples, dtype=np.uint8).reshape(
+                    pixmap.height, pixmap.width, pixmap.n
+                )
+                result = engine(image)
+                units = _pdf_ocr_units_from_result(
+                    result, image, page_width, page_height
+                )
+                page_info["units"] = units
+                page_info["geometry_source"] = "ocr"
+                page_info["ocr"] = True
+                cached_pages[str(page_number)] = copy.deepcopy(units)
+                _pdf_save_ocr_cache(data, cache)
+            except DocumentFormatError:
+                raise
+            except Exception as exc:
+                raise DocumentFormatError(
+                    f"PDF 第 {page_number} 页 OCR 识别失败"
+                ) from exc
+            finally:
+                del result, image, pixmap
+                gc.collect()
+    finally:
+        document.close()
+
+
+def _pdf_has_text_layer(data):
+    """只探测文字层，不渲染图片；用于决定扫描 PDF 的首次选页策略。"""
+    with _pdf_decode_limits():
+        reader = _pdf_reader(data)
+        for page in reader.pages:
+            try:
+                text = page.extract_text() or ""
+            except Exception:
+                continue
+            if re.search(r"[\w\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]", text):
+                return True
+    return False
+
+
 def _pdf_document_units(
     data, page_start=None, page_end=None, page_selection=None,
 ):
@@ -1066,8 +1437,12 @@ def _pdf_document_units(
                 "复杂 PDF 版面支持尚未安装，请先运行: py -3 -m pip install -r requirements.txt"
             ) from exc
         try:
+            source_path = _binary_path(data)
+            plumber_source = (
+                source_path if source_path is not None else io.BytesIO(bytes(data))
+            )
             with pdfplumber.open(
-                io.BytesIO(bytes(data)),
+                plumber_source,
                 laparams={"boxes_flow": -0.5, "detect_vertical": True},
                 unicode_norm="NFC",
             ) as plumber:
@@ -1098,10 +1473,14 @@ def _pdf_document_units(
         except Exception as exc:
             raise DocumentFormatError("复杂 PDF 页面结构读取失败") from exc
 
-    if not any(page["units"] for page in pages):
-        raise DocumentFormatError(
-            "PDF 没有可用文字层；扫描件或图片 PDF 请先使用 OCR"
-        )
+    # 没有文字层的页按页 OCR。已有文字层的页继续走原生提取，避免 OCR
+    # 改坏可靠文本；纯插图页识别不到文字时保持空单元并在输出中原样保留。
+    ocr_pages = [
+        page for page in pages
+        if not page["units"] and not page.get("preserve_art_text")
+    ]
+    if ocr_pages:
+        _pdf_fill_ocr_pages(data, ocr_pages)
     return pages
 
 
@@ -2259,6 +2638,19 @@ def _pdf_boxes_from_units(page_units, width, height):
                 "font_size": float(source["font_size"]),
                 "color": tuple(source["color"]),
             }
+            if "background_color" in source:
+                box["background_color"] = tuple(source["background_color"])
+            if isinstance(source.get("erase_boxes"), list):
+                box["erase_boxes"] = [
+                    {
+                        "left": float(item["left"]),
+                        "right": float(item["right"]),
+                        "top": float(item["top"]),
+                        "bottom": float(item["bottom"]),
+                        "color": tuple(item["color"]),
+                    }
+                    for item in source["erase_boxes"]
+                ]
         except (KeyError, TypeError, ValueError, OverflowError) as exc:
             raise _PDFLayoutFallback from exc
         if (
@@ -2412,7 +2804,7 @@ def _build_pdf_layout_page(
     width, height = page["size"]
     if page.get("force_reflow") or not _pdf_page_origin_is_supported(source_page):
         raise _PDFLayoutFallback
-    if page.get("geometry_source") == "pdfplumber":
+    if page.get("geometry_source") in {"pdfplumber", "ocr"}:
         boxes = _pdf_boxes_from_units(page["units"], width, height)
     else:
         if _pdf_page_has_external_text(source_page):
@@ -2477,6 +2869,26 @@ def _build_pdf_layout_page(
         lines = plan["lines"]
         page_label = plan["page_label"]
         draw_font = plan["font_name"]
+        erase_boxes = box.get("erase_boxes") or []
+        background = box.get("background_color")
+        if erase_boxes or background is not None:
+            # 扫描页的原文属于背景图片，不能像文字层那样删除操作符。
+            # 用文字框边缘采样的底色覆盖原字，再在同一框内绘制译文。
+            padding = max(1.0, min(6.0, size * 0.15))
+            regions = erase_boxes or [{
+                "left": box["left"], "right": box["right"],
+                "bottom": box["bottom"], "top": box["top"],
+                "color": background,
+            }]
+            for region in regions:
+                left = max(0.0, region["left"] - padding)
+                right = min(width, region["right"] + padding)
+                bottom = max(0.0, region["bottom"] - padding)
+                top = min(height, region["top"] + padding)
+                overlay.saveState()
+                overlay.setFillColorRGB(*region["color"])
+                overlay.rect(left, bottom, right - left, top - bottom, fill=1, stroke=0)
+                overlay.restoreState()
         overlay.setFont(draw_font, size)
         overlay.setFillColorRGB(*box["color"])
         baseline = box["top"] - size * 0.9
@@ -2762,12 +3174,13 @@ def _build_pdf(
                     writer.add_page(rendered_page)
                 reflow_pages += 1
 
+        source_kind = "scanned PDF" if any(page.get("ocr") for page in pages) else "text-layer PDF"
         if reflow_pages and layout_pages:
-            subject = "Mixed layout-preserving and reflowed translation from a text-layer PDF"
+            subject = f"Mixed layout-preserving and reflowed translation from a {source_kind}"
         elif reflow_pages:
-            subject = "Reflowed translation generated from a text-layer PDF"
+            subject = f"Reflowed translation generated from a {source_kind}"
         else:
-            subject = "Layout-preserving translation generated from a text-layer PDF"
+            subject = f"Layout-preserving translation generated from a {source_kind}"
         writer.metadata = {
             "/Title": str(document_title or "Translated document"),
             "/Author": "",
@@ -2842,17 +3255,58 @@ def _safe_source_id(source_id):
     return value
 
 
+def _cached_source_result(destination, source_id, extension, digest):
+    with FORMAT_LOCK:
+        pdf_page_count_value = None
+        pdf_page_selection = None
+        pdf_ocr = False
+        if extension == ".pdf":
+            pdf_page_count_value = pdf_page_count(destination)
+            pdf_ocr = not _pdf_has_text_layer(destination)
+            # 扫描 PDF 先识别一页，让导入尽快完成并立即交给用户多选页；
+            # 普通文字层 PDF 保持原有的默认全文行为。
+            pdf_page_selection = "1" if pdf_ocr else "all"
+            pages = _pdf_document_units(
+                destination, page_selection=pdf_page_selection
+            )
+            content = _pdf_units_text(pages)
+        else:
+            content = extract_binary_text(extension, destination)
+    result = {
+        "source_id": source_id,
+        "source_format": extension.lstrip("."),
+        "source_sha256": digest,
+        "content": content,
+    }
+    if pdf_page_count_value is not None:
+        selected_pages = normalize_pdf_page_selection(
+            pdf_page_count_value, pdf_page_selection
+        )
+        result.update({
+            "pdf_page_count": pdf_page_count_value,
+            "pdf_page_start": selected_pages[0],
+            "pdf_page_end": selected_pages[-1],
+            "pdf_page_selection": pdf_page_selection,
+            "pdf_extraction_version": PDF_EXTRACTION_VERSION,
+            "pdf_ocr": pdf_ocr,
+        })
+    return result
+
+
+def _remove_cached_source_files(destination):
+    for candidate in (
+        destination, destination + ".ocr.json", destination + ".ocr.json.tmp",
+    ):
+        with contextlib.suppress(OSError):
+            os.remove(candidate)
+
+
 def cache_binary_source(cache_dir, filename, data):
     extension = document_extension(filename)
     if extension not in BINARY_EXTENSIONS:
         raise DocumentFormatError("不支持的二进制文档格式")
-    pdf_page_count = None
-    if extension == ".pdf":
-        pages = _pdf_document_units(data)
-        content = _pdf_units_text(pages)
-        pdf_page_count = len(pages)
-    else:
-        content = extract_binary_text(extension, data)
+    if not isinstance(data, (bytes, bytearray)) or not data:
+        raise DocumentFormatError("文档数据无效")
     os.makedirs(cache_dir, exist_ok=True)
     source_id = uuid.uuid4().hex + extension
     destination = os.path.join(cache_dir, source_id)
@@ -2861,49 +3315,96 @@ def cache_binary_source(cache_dir, filename, data):
         with open(temporary, "wb") as handle:
             handle.write(data)
         os.replace(temporary, destination)
+        return _cached_source_result(
+            destination, source_id, extension, binary_digest(data)
+        )
+    except Exception:
+        _remove_cached_source_files(destination)
+        raise
     finally:
-        try:
+        with contextlib.suppress(OSError):
             os.remove(temporary)
-        except OSError:
-            pass
-    result = {
-        "source_id": source_id,
-        "source_format": extension.lstrip("."),
-        "source_sha256": binary_digest(data),
-        "content": content,
-    }
-    if pdf_page_count is not None:
-        result.update({
-            "pdf_page_count": pdf_page_count,
-            "pdf_page_start": 1,
-            "pdf_page_end": pdf_page_count,
-            "pdf_page_selection": "all",
-            "pdf_extraction_version": PDF_EXTRACTION_VERSION,
-        })
-    return result
+
+
+def cache_binary_source_stream(
+    cache_dir, filename, source_stream, content_length, chunk_size=1024 * 1024,
+):
+    """把 HTTP 请求体分块写入内部缓存，不在浏览器或 Python 中复制整份文件。"""
+    extension = document_extension(filename)
+    if extension not in BINARY_EXTENSIONS:
+        raise DocumentFormatError("不支持的二进制文档格式")
+    try:
+        remaining = int(content_length)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise DocumentFormatError("导入文件长度无效") from exc
+    if remaining <= 0:
+        raise DocumentFormatError("文档为空")
+    os.makedirs(cache_dir, exist_ok=True)
+    source_id = uuid.uuid4().hex + extension
+    destination = os.path.join(cache_dir, source_id)
+    temporary = destination + ".tmp"
+    digest = hashlib.sha256()
+    try:
+        with open(temporary, "wb") as handle:
+            while remaining:
+                chunk = source_stream.read(
+                    min(max(4096, int(chunk_size)), remaining)
+                )
+                if not chunk:
+                    raise DocumentFormatError("文档上传中断，请重新添加文件")
+                handle.write(chunk)
+                digest.update(chunk)
+                remaining -= len(chunk)
+        os.replace(temporary, destination)
+        return _cached_source_result(
+            destination, source_id, extension, digest.hexdigest()
+        )
+    except Exception:
+        _remove_cached_source_files(destination)
+        raise
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(temporary)
+
+
+def load_binary_source_path(
+    cache_dir, source_id, expected_format="", expected_sha256="",
+):
+    safe_id = _safe_source_id(source_id)
+    if expected_format and not safe_id.endswith(
+        "." + str(expected_format).lower().lstrip(".")
+    ):
+        raise DocumentFormatError("二进制原文格式与缓存不一致")
+    path = os.path.join(cache_dir, safe_id)
+    if not os.path.isfile(path):
+        raise DocumentFormatError("二进制原文缓存不存在，请重新添加文件")
+    digest = binary_digest(path)
+    if expected_sha256 and digest != expected_sha256:
+        raise DocumentFormatError("二进制原文缓存校验失败，请重新添加文件")
+    return path
 
 
 def load_binary_source(cache_dir, source_id, expected_format="", expected_sha256=""):
-    safe_id = _safe_source_id(source_id)
-    if expected_format and not safe_id.endswith("." + str(expected_format).lower().lstrip(".")):
-        raise DocumentFormatError("二进制原文格式与缓存不一致")
-    path = os.path.join(cache_dir, safe_id)
+    path = load_binary_source_path(
+        cache_dir, source_id, expected_format, expected_sha256
+    )
     try:
         with open(path, "rb") as handle:
-            data = handle.read()
-    except FileNotFoundError as exc:
-        raise DocumentFormatError("二进制原文缓存不存在，请重新添加文件") from exc
-    digest = binary_digest(data)
-    if expected_sha256 and digest != expected_sha256:
-        raise DocumentFormatError("二进制原文缓存校验失败，请重新添加文件")
-    return data
+            return handle.read()
+    except OSError as exc:
+        raise DocumentFormatError("无法读取二进制原文缓存") from exc
 
 
 def delete_binary_source(cache_dir, source_id):
     safe_id = _safe_source_id(source_id)
     path = os.path.join(cache_dir, safe_id)
+    existed = os.path.isfile(path)
     try:
-        os.remove(path)
-        return True
-    except FileNotFoundError:
-        return False
+        for candidate in (path, path + ".ocr.json", path + ".ocr.json.tmp"):
+            try:
+                os.remove(candidate)
+            except FileNotFoundError:
+                pass
+    except OSError as exc:
+        raise DocumentFormatError("无法删除二进制原文缓存") from exc
+    return existed

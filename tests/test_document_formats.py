@@ -867,11 +867,85 @@ class DocumentFormatTests(unittest.TestCase):
         self.assertTrue(shaping("ᠮᠣᠩᠭᠣᠯ"))
         self.assertFalse(shaping("Plain English 2026"))
 
-    def test_pdf_without_text_layer_and_encrypted_pdf_are_rejected(self):
-        with self.assertRaisesRegex(DocumentFormatError, "文字层|OCR"):
-            extract_binary_text("pdf", make_pdf(text_layer=False))
+    def test_pdf_without_text_layer_can_be_an_unchanged_image_page(self):
+        old_fill = document_formats._pdf_fill_ocr_pages
+        try:
+            # A pure illustration is a valid selected page: OCR may find no text,
+            # in which case the output builder simply preserves it unchanged.
+            document_formats._pdf_fill_ocr_pages = lambda _data, _pages: None
+            self.assertEqual(extract_binary_text("pdf", make_pdf(text_layer=False)), "")
+        finally:
+            document_formats._pdf_fill_ocr_pages = old_fill
         with self.assertRaisesRegex(DocumentFormatError, "加密"):
             extract_binary_text("pdf", make_pdf(encrypted=True))
+
+    def test_pdf_ocr_boxes_filter_isolated_art_letters(self):
+        import numpy as np
+
+        class Result:
+            boxes = np.array([
+                [[10, 10], [20, 10], [20, 30], [10, 30]],
+                [[40, 40], [240, 40], [240, 75], [40, 75]],
+            ], dtype=np.float32)
+            txts = ("H", "Readable scanned sentence.")
+            scores = (0.99, 0.98)
+
+        image = np.full((400, 300, 3), 245, dtype=np.uint8)
+        units = document_formats._pdf_ocr_units_from_result(
+            Result(), image, 300.0, 400.0
+        )
+
+        self.assertEqual([unit["text"] for unit in units], ["Readable scanned sentence."])
+        self.assertEqual(
+            units[0]["box"]["erase_boxes"][0]["color"],
+            (0.96078, 0.96078, 0.96078),
+        )
+        self.assertTrue(units[0]["ocr"])
+
+    def test_pdf_ocr_page_cache_is_reused_and_deleted_with_source(self):
+        import numpy as np
+
+        class Result:
+            boxes = np.array([
+                [[100, 100], [900, 100], [900, 180], [100, 180]],
+            ], dtype=np.float32)
+            txts = ("Cached scanned sentence.",)
+            scores = (0.99,)
+
+        class Engine:
+            def __init__(self):
+                self.calls = 0
+
+            def __call__(self, _image):
+                self.calls += 1
+                return Result()
+
+        old_engine = document_formats._PDF_OCR_ENGINE
+        engine = Engine()
+        document_formats._PDF_OCR_ENGINE = engine
+        try:
+            with tempfile.TemporaryDirectory() as root:
+                source_id = "a" * 32 + ".pdf"
+                source_path = os.path.join(root, source_id)
+                with open(source_path, "wb") as handle:
+                    handle.write(make_pdf(text_layer=False))
+
+                self.assertEqual(
+                    extract_binary_text("pdf", source_path),
+                    "Cached scanned sentence.",
+                )
+                self.assertEqual(
+                    extract_binary_text("pdf", source_path),
+                    "Cached scanned sentence.",
+                )
+                self.assertEqual(engine.calls, 1)
+                self.assertTrue(os.path.isfile(source_path + ".ocr.json"))
+
+                self.assertTrue(delete_binary_source(root, source_id))
+                self.assertFalse(os.path.exists(source_path))
+                self.assertFalse(os.path.exists(source_path + ".ocr.json"))
+        finally:
+            document_formats._PDF_OCR_ENGINE = old_engine
 
     def test_pdf_parser_byte_limits_are_temporarily_disabled_and_restored(self):
         import pypdf.filters as pdf_filters
@@ -1577,13 +1651,10 @@ class DocumentFormatTests(unittest.TestCase):
                 connection = http.client.HTTPConnection(
                     "127.0.0.1", server.server_address[1], timeout=5
                 )
-                payload = json.dumps({
-                    "name": "sample.docx",
-                    "data_base64": base64.b64encode(make_docx()).decode("ascii"),
-                }).encode("utf-8")
+                payload = make_docx()
                 connection.request(
-                    "POST", "/api/import", body=payload,
-                    headers={"Content-Type": "application/json"},
+                    "POST", "/api/import?name=sample.docx", body=payload,
+                    headers={"Content-Type": "application/octet-stream"},
                 )
                 response = connection.getresponse()
                 imported = json.loads(response.read().decode("utf-8"))

@@ -1,4 +1,7 @@
 pypdf>=6.16.2,<7
 pdfplumber>=0.11.10,<0.12
+pymupdf>=1.24,<2
+rapidocr>=3.9,<4
+onnxruntime>=1.20,<2
 reportlab>=4.4,<6
 uharfbuzz>=0.50,<1
