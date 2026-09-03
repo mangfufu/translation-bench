@@ -624,6 +624,28 @@ class TranslationFlowTests(unittest.TestCase):
             with app.JOBS_LOCK:
                 app.JOBS.pop(job_id, None)
 
+    def test_binary_source_cache_reports_and_clears_only_regular_files(self):
+        original_cache_dir = app.SOURCE_CACHE_DIR
+        with tempfile.TemporaryDirectory() as root:
+            app.SOURCE_CACHE_DIR = root
+            try:
+                with open(os.path.join(root, "source.pdf"), "wb") as handle:
+                    handle.write(b"pdf-cache")
+                with open(os.path.join(root, "source.pdf.ocr.json"), "wb") as handle:
+                    handle.write(b"ocr")
+                os.mkdir(os.path.join(root, "reserved"))
+
+                stats = app.binary_source_cache_stats()
+                cleared = app.clear_binary_source_cache()
+
+                self.assertEqual(stats["source_files"], 1)
+                self.assertEqual(stats["auxiliary_files"], 1)
+                self.assertEqual(stats["total_bytes"], 12)
+                self.assertEqual(cleared["removed_files"], 2)
+                self.assertEqual(os.listdir(root), ["reserved"])
+            finally:
+                app.SOURCE_CACHE_DIR = original_cache_dir
+
     def test_finished_job_pruning_applies_global_text_budget(self):
         original_budget = app.MAX_FINISHED_JOB_TEXT_CHARS
         with app.JOBS_LOCK:

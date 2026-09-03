@@ -438,6 +438,51 @@ def clear_output_cache():
     return cached, legacy_removed
 
 
+def binary_source_cache_stats():
+    """统计内部二进制原文和 OCR 缓存，不跟随符号链接。"""
+    source_files = 0
+    auxiliary_files = 0
+    total_bytes = 0
+    if not os.path.isdir(SOURCE_CACHE_DIR):
+        return {
+            "source_files": 0,
+            "auxiliary_files": 0,
+            "total_bytes": 0,
+        }
+    for entry in os.scandir(SOURCE_CACHE_DIR):
+        if not entry.is_file(follow_symlinks=False):
+            continue
+        try:
+            total_bytes += entry.stat(follow_symlinks=False).st_size
+        except FileNotFoundError:
+            continue
+        if document_extension(entry.name) in BINARY_EXTENSIONS:
+            source_files += 1
+        else:
+            auxiliary_files += 1
+    return {
+        "source_files": source_files,
+        "auxiliary_files": auxiliary_files,
+        "total_bytes": total_bytes,
+    }
+
+
+def clear_binary_source_cache():
+    """清空内部原文缓存；调用方必须先确认没有任务正在运行。"""
+    before = binary_source_cache_stats()
+    removed_files = 0
+    if os.path.isdir(SOURCE_CACHE_DIR):
+        for entry in os.scandir(SOURCE_CACHE_DIR):
+            if not entry.is_file(follow_symlinks=False):
+                continue
+            try:
+                os.remove(entry.path)
+                removed_files += 1
+            except FileNotFoundError:
+                pass
+    return {**before, "removed_files": removed_files}
+
+
 def detect_lang(text):
     """按字符集自动判断语言, 返回下拉框里的语言名。拉丁语系归为英文(模型会按内容理解)。"""
     if re.search(r'[぀-ヿ]', text):          # 平假名/片假名
@@ -1963,6 +2008,8 @@ class Handler(BaseHTTPRequestHandler):
                     and j.get("kind", "document") == requested_kind
                 ]
             self._send_json({"job": running[0] if running else None})
+        elif path == "/api/source-cache":
+            self._send_json({"ok": True, **binary_source_cache_stats()})
         elif path == "/api/source":
             source_id = query.get("id", [""])[0]
             source_format = query.get("format", [""])[0]
@@ -2181,6 +2228,20 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"error": str(exc)}, 400)
                 return
             self._send_json({"ok": True, "deleted": deleted})
+            return
+        if path == "/api/source-cache":
+            with JOBS_LOCK:
+                if any(job.get("status") == "running" for job in JOBS.values()):
+                    self._send_json(
+                        {"error": "翻译任务正在运行，不能清除原文缓存"}, 409
+                    )
+                    return
+                try:
+                    cleared = clear_binary_source_cache()
+                except OSError as exc:
+                    self._send_json({"error": f"清除原文缓存失败: {exc}"}, 500)
+                    return
+            self._send_json({"ok": True, **cleared})
             return
         if path == "/api/cache":
             try:

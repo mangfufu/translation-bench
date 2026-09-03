@@ -110,6 +110,7 @@
   .file.selected .delete:hover:not(:disabled),.file.selected .retry:hover:not(:disabled),.file.selected .retranslate-file:hover:not(:disabled){border-color:#000;background:#000;color:#fff}
   .queue-foot{flex:none;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 12px;border-top:1px solid var(--line-2);color:var(--ink-faint);font:10px var(--mono);background:#050505}
   .queue-foot button{padding:4px 7px;font:10px var(--mono);white-space:nowrap}
+  .cache-actions{display:flex;align-items:center;gap:5px}
 
   .detail-panel{display:flex;flex-direction:column;background:var(--paper)}
   .detail-head{min-height:50px;flex:none;display:flex;align-items:center;flex-wrap:wrap;gap:7px 12px;padding:7px 16px;border-bottom:1px solid var(--line-2);background:#050505}
@@ -327,7 +328,13 @@
       <div id="cur"></div>
     </div>
     <div id="list"><div class="empty">尚未添加文档</div></div>
-    <div class="queue-foot"><span>结果自动保存至 outputs\</span><button class="quiet" id="btnClearCache">清除缓存</button></div>
+    <div class="queue-foot">
+      <span>结果自动保存至 outputs\</span>
+      <div class="cache-actions">
+        <button class="quiet" id="btnClearSourceCache">原文缓存</button>
+        <button class="quiet" id="btnClearCache">记录缓存</button>
+      </div>
+    </div>
   </section>
 
   <div class="splitter" data-split="queue" title="拖动调整任务栏宽度"></div>
@@ -1189,8 +1196,54 @@ $('btnClear').addEventListener('click', async () => {
   $('cur').textContent='';
   render();
 });
+function formatCacheSize(bytes){
+  const value=Math.max(0,Number(bytes)||0);
+  if(value<1024) return `${value} B`;
+  if(value<1024*1024) return `${(value/1024).toFixed(1)} KB`;
+  if(value<1024*1024*1024) return `${(value/1024/1024).toFixed(1)} MB`;
+  return `${(value/1024/1024/1024).toFixed(2)} GB`;
+}
+$('btnClearSourceCache').addEventListener('click',async()=>{
+  if(jobId || dialogJobId || submitting || lineRetranslating || lineSaving || lineEditing) return;
+  let stats;
+  try{
+    const response=await fetch('/api/source-cache');
+    stats=await response.json();
+    if(!response.ok || !stats.ok) throw new Error(stats.error||`HTTP ${response.status}`);
+  }catch(error){
+    await appAlert('读取原文缓存失败：'+error.message,'读取失败');
+    return;
+  }
+  if(!stats.source_files && !stats.auxiliary_files){
+    await appAlert('当前没有二进制原文缓存。','原文缓存');
+    return;
+  }
+  const dependent=files.filter(file=>!!file.source_id);
+  const confirmed=await appConfirm(
+    `清除全部二进制原文缓存？\n\n当前共 ${stats.source_files} 个原文文件，`+
+    `${stats.auxiliary_files} 个 OCR/临时文件，占用 ${formatCacheSize(stats.total_bytes)}。`+
+    `${dependent.length ? `\n\n任务列表中依赖缓存的 ${dependent.length} 个 PDF、DOCX 或 EPUB 任务也会移除。` : ''}`+
+    '\n\noutputs 中的译文和电脑上的原始文件不会删除；以后需要时可重新导入。',
+    '清除原文缓存'
+  );
+  if(!confirmed) return;
+  try{
+    const response=await fetch('/api/source-cache',{method:'DELETE'});
+    const result=await response.json();
+    if(!response.ok || !result.ok) throw new Error(result.error||`HTTP ${response.status}`);
+    const selectedFile=files[selectedIdx]||null;
+    files=files.filter(file=>!file.source_id);
+    selectedIdx=selectedFile && files.includes(selectedFile)
+      ? files.indexOf(selectedFile)
+      : (files.length ? 0 : -1);
+    $('cur').textContent=`已清除 ${result.removed_files} 个缓存文件，释放 ${formatCacheSize(result.total_bytes)}`;
+    render();
+  }catch(error){
+    await appAlert('清除原文缓存失败：'+error.message,'清除失败');
+  }
+});
 $('btnClearCache').addEventListener('click', async () => {
-  if(jobId || submitting || lineRetranslating || lineSaving || lineEditing) return;
+  if(jobId || dialogJobId || submitting || lineRetranslating || lineSaving || lineEditing) return;
   const completed = files.filter(file => file.status === 'ok').length;
   const confirmed = await appConfirm(
     `清除完成记录和恢复缓存？${completed ? `\n\n任务列表中将移除 ${completed} 个已完成任务。` : ''}\n\noutputs 中的实际译文不会被删除。`,
@@ -1349,7 +1402,9 @@ function render(){
   $('btnStop').textContent = interrupting ? '正在中断…' : '中断';
   $('btnZip').disabled = !lastJob || !!lineRetranslating || lineSaving || !!lineEditing;
   $('btnClear').disabled = files.length === 0 || !!jobId || !!lineRetranslating || lineSaving || !!lineEditing;
-  $('btnClearCache').disabled = !!jobId || submitting || !!lineRetranslating || lineSaving || !!lineEditing;
+  const cacheBusy=!!jobId || !!dialogJobId || submitting || !!lineRetranslating || lineSaving || !!lineEditing;
+  $('btnClearSourceCache').disabled=cacheBusy;
+  $('btnClearCache').disabled=cacheBusy;
   const list = $('list');
   if(files.length === 0){
     taskListScrollTop = 0;
