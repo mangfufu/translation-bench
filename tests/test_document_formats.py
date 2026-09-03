@@ -873,51 +873,22 @@ class DocumentFormatTests(unittest.TestCase):
         with self.assertRaisesRegex(DocumentFormatError, "加密"):
             extract_binary_text("pdf", make_pdf(encrypted=True))
 
-    def test_pdf_content_stream_limits_run_before_text_extraction(self):
-        from pypdf import PdfReader
-
-        source = make_pdf()
-        reader = PdfReader(io.BytesIO(source))
-        first_size = len(reader.pages[0].get_contents().get_data())
-        old_page_limit = document_formats.MAX_PDF_PAGE_CONTENT_BYTES
-        old_total_limit = document_formats.MAX_PDF_TOTAL_CONTENT_BYTES
-        try:
-            document_formats.MAX_PDF_PAGE_CONTENT_BYTES = first_size - 1
-            with self.assertRaisesRegex(DocumentFormatError, "单页解压内容流"):
-                extract_binary_text("pdf", source)
-
-            document_formats.MAX_PDF_PAGE_CONTENT_BYTES = old_page_limit
-            document_formats.MAX_PDF_TOTAL_CONTENT_BYTES = 1
-            with self.assertRaisesRegex(DocumentFormatError, "合计"):
-                extract_binary_text("pdf", source)
-        finally:
-            document_formats.MAX_PDF_PAGE_CONTENT_BYTES = old_page_limit
-            document_formats.MAX_PDF_TOTAL_CONTENT_BYTES = old_total_limit
-
-    def test_pdf_parser_limits_are_temporarily_tightened_and_restored(self):
+    def test_pdf_parser_byte_limits_are_temporarily_disabled_and_restored(self):
         import pypdf.filters as pdf_filters
 
         names = (
             "FLATE_MAX_BUFFER_SIZE",
             "JBIG2_MAX_OUTPUT_LENGTH",
             "LZW_MAX_OUTPUT_LENGTH",
+            "MAX_ARRAY_BASED_STREAM_OUTPUT_LENGTH",
+            "MAX_DECLARED_STREAM_LENGTH",
             "RUN_LENGTH_MAX_OUTPUT_LENGTH",
             "ZLIB_MAX_OUTPUT_LENGTH",
         )
         previous = {name: getattr(pdf_filters, name) for name in names}
-        declared_stream_limit = getattr(
-            pdf_filters, "MAX_DECLARED_STREAM_LENGTH", None
-        )
         with document_formats._pdf_decode_limits():
             for name in names:
-                self.assertLessEqual(
-                    getattr(pdf_filters, name),
-                    document_formats.MAX_PDF_PAGE_CONTENT_BYTES + 1,
-                )
-            self.assertEqual(
-                getattr(pdf_filters, "MAX_DECLARED_STREAM_LENGTH", None),
-                declared_stream_limit,
-            )
+                self.assertEqual(getattr(pdf_filters, name), document_formats.sys.maxsize)
         self.assertEqual(
             {name: getattr(pdf_filters, name) for name in names},
             previous,

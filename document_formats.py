@@ -7,6 +7,7 @@ import io
 import os
 import posixpath
 import re
+import sys
 import threading
 import unicodedata
 import uuid
@@ -25,9 +26,6 @@ PDF_EXTRACTION_VERSION = 5
 MAX_ZIP_MEMBERS = 5000
 MAX_ZIP_COMPRESSION_RATIO = 1000.0
 MAX_PDF_PAGES = 1000
-MAX_PDF_TEXT_CHARS = 20 * 1024 * 1024
-MAX_PDF_PAGE_CONTENT_BYTES = 16 * 1024 * 1024
-MAX_PDF_TOTAL_CONTENT_BYTES = 64 * 1024 * 1024
 PDF_STRICT_MIN_FONT_SIZE = 1.0
 
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -610,7 +608,7 @@ def _pdf_reader(data):
 
 @contextlib.contextmanager
 def _pdf_decode_limits():
-    """临时收紧 pypdf 的流解压上限，避免检查长度前已展开巨量数据。"""
+    """本地可信文件处理期间临时取消 pypdf 的固定字节上限。"""
     try:
         import pypdf.filters as pdf_filters
     except ImportError:
@@ -621,6 +619,7 @@ def _pdf_decode_limits():
         "JBIG2_MAX_OUTPUT_LENGTH",
         "ZLIB_MAX_OUTPUT_LENGTH",
         "LZW_MAX_OUTPUT_LENGTH",
+        "MAX_DECLARED_STREAM_LENGTH",
         "RUN_LENGTH_MAX_OUTPUT_LENGTH",
         "MAX_ARRAY_BASED_STREAM_OUTPUT_LENGTH",
     )
@@ -630,11 +629,7 @@ def _pdf_decode_limits():
             continue
         value = getattr(pdf_filters, name)
         previous[name] = value
-        # 这里只限制实际解码输出，不再按输入文件大小限制合法的大型
-        # 图片或流声明；页面内容流仍会在提取前后接受独立安全检查。
-        hard_limit = MAX_PDF_PAGE_CONTENT_BYTES + 1
-        if not isinstance(value, int) or value <= 0 or value > hard_limit:
-            setattr(pdf_filters, name, hard_limit)
+        setattr(pdf_filters, name, sys.maxsize)
     try:
         yield
     finally:
@@ -703,20 +698,6 @@ def _pdf_page_text(page):
         else " "
         for character in value
     )
-
-
-def _pdf_page_content_size(page):
-    """在文字解释器运行前检查解压后的页面指令流大小。"""
-    try:
-        contents = page.get_contents()
-        if contents is None:
-            return 0
-        size = len(contents.get_data())
-    except Exception as exc:
-        raise DocumentFormatError("PDF 页面内容流无法安全解压") from exc
-    if size > MAX_PDF_PAGE_CONTENT_BYTES:
-        raise DocumentFormatError("PDF 单页解压内容流超过 16MB 安全限制")
-    return size
 
 
 def _pdf_page_units(page, text=None):
@@ -1007,14 +988,9 @@ def _pdf_document_units(
             len(reader.pages), page_selection, page_start, page_end
         )
         pages = []
-        total_characters = 0
-        total_content_bytes = 0
         try:
             for page_number in selected_pages:
                 page = reader.pages[page_number - 1]
-                total_content_bytes += _pdf_page_content_size(page)
-                if total_content_bytes > MAX_PDF_TOTAL_CONTENT_BYTES:
-                    raise DocumentFormatError("PDF 解压内容流合计超过 64MB 安全限制")
                 modes = _pdf_page_text_render_modes(page)
                 preserve_art_text = modes == {7}
                 visible_crop = _pdf_page_has_distinct_cropbox(page)
@@ -1027,9 +1003,6 @@ def _pdf_document_units(
                 units = [] if not page_text else _pdf_page_units(page, page_text)
                 if units:
                     units = _pdf_units_with_repaired_word_spacing(page, units)
-                total_characters += sum(len(unit["text"]) for unit in units)
-                if total_characters > MAX_PDF_TEXT_CHARS:
-                    raise DocumentFormatError("PDF 可提取文字超过 20MB 限制")
                 pages.append({
                     "page_number": page_number,
                     "size": _pdf_page_size(page),
@@ -1125,11 +1098,6 @@ def _pdf_document_units(
         except Exception as exc:
             raise DocumentFormatError("复杂 PDF 页面结构读取失败") from exc
 
-    total_characters = sum(
-        len(unit["text"]) for page in pages for unit in page["units"]
-    )
-    if total_characters > MAX_PDF_TEXT_CHARS:
-        raise DocumentFormatError("PDF 可提取文字超过 20MB 限制")
     if not any(page["units"] for page in pages):
         raise DocumentFormatError(
             "PDF 没有可用文字层；扫描件或图片 PDF 请先使用 OCR"
