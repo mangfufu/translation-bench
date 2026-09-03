@@ -189,6 +189,58 @@ class TranslationFlowTests(unittest.TestCase):
         self.assertIn("[原文]\nOne.\n[译文]\n译：One.", translator.prompts[1])
         self.assertNotIn("Three.", translator.prompts[0])
 
+    def test_lowercase_fragment_gets_ambiguous_boundary_instruction(self):
+        translator = FakeTranslator(context_mode="neighbor")
+
+        ok, output = translator.translate_content(
+            "One of the players immediately\n"
+            "responds to this, putting on the voice of their investigator."
+        )
+
+        self.assertTrue(ok, output)
+        self.assertNotIn("【单元边界判断】", translator.prompts[0])
+        self.assertIn("【单元边界判断】", translator.prompts[1])
+        self.assertIn("不得仅因缺少标点而省略主语", translator.prompts[1])
+
+    def test_layout_hint_confirms_cross_column_continuation(self):
+        translator = FakeTranslator(context_mode="unit")
+
+        ok, output = translator.translate_content(
+            "One of the players immediately\nResponds in the next column.",
+            continuation_hints=["separate", "strong"],
+        )
+
+        self.assertTrue(ok, output)
+        self.assertIn("【跨单元衔接提示】", translator.prompts[1])
+        self.assertIn("版面结构表明", translator.prompts[1])
+        self.assertIn("【最近已确认译文", translator.prompts[1])
+        self.assertIn("[原文]\nOne of the players immediately", translator.prompts[1])
+
+    def test_layout_separation_suppresses_lowercase_text_guess(self):
+        translator = FakeTranslator(context_mode="neighbor")
+
+        ok, output = translator.translate_content(
+            "An unpunctuated paragraph\n"
+            "another unpunctuated paragraph",
+            continuation_hints=["separate", "separate"],
+        )
+
+        self.assertTrue(ok, output)
+        self.assertNotIn("【单元边界判断】", translator.prompts[1])
+        self.assertNotIn("【跨单元衔接提示】", translator.prompts[1])
+
+    def test_complete_sentence_does_not_trigger_continuation_instruction(self):
+        translator = FakeTranslator(context_mode="neighbor")
+
+        ok, output = translator.translate_content(
+            "The first paragraph is complete.\n"
+            "the next paragraph deliberately starts in lowercase."
+        )
+
+        self.assertTrue(ok, output)
+        self.assertNotIn("【单元边界判断】", translator.prompts[1])
+        self.assertNotIn("【跨单元衔接提示】", translator.prompts[1])
+
     def test_unit_mode_sends_only_the_current_unit(self):
         translator = FakeTranslator(
             context_mode="unit",
@@ -357,6 +409,61 @@ class TranslationFlowTests(unittest.TestCase):
         self.assertIn("测试回复", log)
         self.assertNotIn("private-test-api-key", log)
         self.assertFalse(sent_payload["chat_template_kwargs"]["enable_thinking"])
+
+    def test_length_finish_reason_expands_max_tokens_immediately(self):
+        translator = Translator({
+            "context_size": 4096,
+            "max_retries": 3,
+            "src_lang": "英文",
+            "tgt_lang": "中文",
+        })
+        budgets = []
+        streamed = []
+
+        def fake_post(payload, on_delta=None):
+            budgets.append(payload["max_tokens"])
+            output = "截断译文" if len(budgets) == 1 else "完整译文"
+            if on_delta:
+                on_delta(output, output)
+            return {
+                "choices": [{
+                    "message": {"content": output},
+                    "finish_reason": "length" if len(budgets) == 1 else "stop",
+                }]
+            }
+
+        translator._post_json = fake_post
+        with contextlib.redirect_stdout(io.StringIO()):
+            ok, output = translator._complete_prompt(
+                "Translate this long block.", 256, streamed.append
+            )
+
+        self.assertTrue(ok, output)
+        self.assertEqual(output, "完整译文")
+        self.assertEqual(budgets[0], 256)
+        self.assertGreater(budgets[1], budgets[0])
+        self.assertEqual(streamed, ["", "截断译文", "", "完整译文"])
+
+    def test_length_does_not_repeat_when_context_cannot_expand(self):
+        translator = Translator({"context_size": 2048, "max_retries": 5})
+        calls = []
+
+        def fake_post(payload, on_delta=None):
+            calls.append(payload["max_tokens"])
+            return {
+                "choices": [{
+                    "message": {"content": "still truncated"},
+                    "finish_reason": "length",
+                }]
+            }
+
+        translator._post_json = fake_post
+        with contextlib.redirect_stdout(io.StringIO()):
+            ok, error = translator._complete_prompt("x" * 10000, 512)
+
+        self.assertFalse(ok)
+        self.assertIn("没有更多上下文空间", error)
+        self.assertEqual(calls, [512])
 
     def test_text_output_restores_original_bom_and_crlf(self):
         original_paths = (app.OUTPUTS_DIR, app.OUTPUT_INDEX_PATH)

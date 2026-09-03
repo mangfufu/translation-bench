@@ -18,7 +18,9 @@ from document_formats import (
     cache_binary_source,
     delete_binary_source,
     extract_binary_text,
+    format_pdf_page_selection,
     load_binary_source,
+    normalize_pdf_page_selection,
 )
 
 
@@ -717,6 +719,102 @@ class DocumentFormatTests(unittest.TestCase):
         self.assertAlmostEqual(coordinates[0][0], 72.0, delta=1.0)
         self.assertAlmostEqual(coordinates[0][1], 720.0, delta=2.0)
 
+    def test_pdf_page_range_extracts_only_selected_pages_and_preserves_others(self):
+        from pypdf import PdfReader
+
+        source = make_pdf()
+        source_reader = PdfReader(io.BytesIO(source))
+        selected = extract_binary_text("pdf", source, 2, 2)
+        translations = "\n".join(
+            f"Selected page translation {index}."
+            for index, _ in enumerate(selected.split("\n"), 1)
+        )
+
+        output = build_binary_output(
+            "pdf",
+            source,
+            translations,
+            target_language="英文",
+            pdf_page_start=2,
+            pdf_page_end=2,
+        )
+        output_reader = PdfReader(io.BytesIO(output))
+
+        self.assertEqual(len(output_reader.pages), 3)
+        self.assertEqual(
+            output_reader.pages[0].extract_text(),
+            source_reader.pages[0].extract_text(),
+        )
+        self.assertEqual(
+            output_reader.pages[2].extract_text(),
+            source_reader.pages[2].extract_text(),
+        )
+        second_page = output_reader.pages[1].extract_text() or ""
+        self.assertIn("Selected page translation 1.", second_page)
+        self.assertNotIn("Inspection Notes", second_page)
+
+    def test_pdf_sparse_page_selection_skips_middle_page_without_modifying_it(self):
+        from pypdf import PdfReader
+
+        source = make_pdf()
+        source_reader = PdfReader(io.BytesIO(source))
+        selected = extract_binary_text(
+            "pdf", source, pdf_page_selection="1,3"
+        )
+        self.assertIn("The Glass Meridian", selected)
+        self.assertIn("Long-form Continuity Sample", selected)
+        self.assertNotIn("Inspection Notes", selected)
+        translations = "\n".join(
+            f"Sparse translation {index}."
+            for index, _ in enumerate(selected.split("\n"), 1)
+        )
+
+        output = build_binary_output(
+            "pdf",
+            source,
+            translations,
+            target_language="英文",
+            pdf_page_selection="1,3",
+        )
+        output_reader = PdfReader(io.BytesIO(output))
+
+        self.assertEqual(len(output_reader.pages), 3)
+        self.assertIn(
+            "Sparse translation 1.", output_reader.pages[0].extract_text() or ""
+        )
+        self.assertEqual(
+            output_reader.pages[1].extract_text(),
+            source_reader.pages[1].extract_text(),
+        )
+        self.assertIn(
+            "Sparse translation", output_reader.pages[2].extract_text() or ""
+        )
+
+    def test_pdf_page_selection_is_normalized_and_strictly_validated(self):
+        self.assertEqual(
+            normalize_pdf_page_selection(10, "1,3-5,8"),
+            (1, 3, 4, 5, 8),
+        )
+        self.assertEqual(
+            format_pdf_page_selection((1, 3, 4, 5, 8), 10),
+            "1,3-5,8",
+        )
+        self.assertEqual(format_pdf_page_selection(range(1, 11), 10), "all")
+        for selection in ([], "1,,3", "0,2", "2-1", "1,11", "x"):
+            with self.subTest(selection=selection):
+                with self.assertRaises(DocumentFormatError):
+                    normalize_pdf_page_selection(10, selection)
+
+    def test_pdf_page_range_is_strictly_validated(self):
+        source = make_pdf()
+
+        with self.assertRaisesRegex(DocumentFormatError, "1–3"):
+            extract_binary_text("pdf", source, 0, 2)
+        with self.assertRaisesRegex(DocumentFormatError, "不能大于"):
+            extract_binary_text("pdf", source, 3, 2)
+        with self.assertRaisesRegex(DocumentFormatError, "必须是整数"):
+            extract_binary_text("pdf", source, "1.5", 2)
+
     def test_pdf_cjk_output_embeds_a_covering_system_font(self):
         source = make_pdf()
         source_units = extract_binary_text("pdf", source).split("\n")
@@ -810,16 +908,81 @@ class DocumentFormatTests(unittest.TestCase):
         previous = {name: getattr(pdf_filters, name) for name in names}
         with document_formats._pdf_decode_limits():
             for name in names:
+                expected_limit = (
+                    document_formats.MAX_BINARY_BYTES + 1
+                    if name == "MAX_DECLARED_STREAM_LENGTH"
+                    else document_formats.MAX_PDF_PAGE_CONTENT_BYTES + 1
+                )
                 self.assertLessEqual(
                     getattr(pdf_filters, name),
-                    document_formats.MAX_PDF_PAGE_CONTENT_BYTES + 1,
+                    expected_limit,
                 )
         self.assertEqual(
             {name: getattr(pdf_filters, name) for name in names},
             previous,
         )
 
-    def test_pdf_long_unit_continues_on_new_pages_without_clipping(self):
+    def test_pdf_toc_rows_discard_broken_leader_glyphs(self):
+        rows = document_formats._pdf_probable_toc_rows(
+            "CONTENTS\n"
+            "Introduction \ufffd\ufffd\ufffd\ufffd    5\n"
+            "Rules \x08\x08\x08\x08    6\n"
+            "Investigators             10\n"
+            "Reference                 25\n"
+            "Credits                   34\n"
+        )
+
+        self.assertEqual(len(rows), 6)
+        self.assertEqual(rows[1], {"title": "Introduction", "page_label": "5"})
+        self.assertEqual(rows[-1], {"title": "Credits", "page_label": "34"})
+        self.assertNotIn("\ufffd", "".join(row["title"] for row in rows))
+        self.assertNotIn("\x08", "".join(row["title"] for row in rows))
+
+    def test_pdf_toc_uses_line_units_and_rebuilds_leaders(self):
+        from reportlab.pdfgen.canvas import Canvas
+        from pypdf import PdfReader
+
+        source_buffer = io.BytesIO()
+        pdf = Canvas(source_buffer, invariant=1)
+        pdf.setFont("Helvetica-Bold", 28)
+        pdf.drawCentredString(306, 730, "CONTENTS")
+        for index, title in enumerate(
+            ("Introduction", "Rules", "Investigators", "Reference", "Credits"),
+            5,
+        ):
+            y = 680 - (index - 5) * 28
+            pdf.setFont("Helvetica", 11)
+            pdf.drawString(72, y, title)
+            pdf.drawRightString(540, y, str(index))
+        pdf.save()
+        source = source_buffer.getvalue()
+
+        page = document_formats._pdf_document_units(source)[0]
+        self.assertEqual(page.get("geometry_source"), "pdfplumber")
+        self.assertEqual(len(page["units"]), 6)
+        self.assertEqual(
+            [unit.get("toc_page_label") for unit in page["units"]],
+            ["", "5", "6", "7", "8", "9"],
+        )
+        translations = "\n".join((
+            "Translated contents",
+            "Translated introduction    5",
+            "Translated rules    6",
+            "Translated investigators    7",
+            "Translated reference    8",
+            "Translated credits    9",
+        ))
+        output = build_binary_output(
+            "pdf", source, translations, target_language="英文"
+        )
+        visible = PdfReader(io.BytesIO(output)).pages[0].extract_text() or ""
+
+        self.assertNotIn("Introduction", visible)
+        self.assertIn("Translated introduction", visible)
+        self.assertIn("5", visible)
+        self.assertNotIn("\ufffd", visible)
+
+    def test_pdf_strict_layout_shrinks_long_unit_without_adding_pages(self):
         from pypdf import PdfReader
 
         source = make_pdf()
@@ -828,7 +991,7 @@ class DocumentFormatTests(unittest.TestCase):
             f"Normal translation {index}." for index in range(len(source_units))
         ]
         translations[0] = (
-            "A very long translated unit must continue across pages. " * 700
+            "A long translated unit must shrink inside its original box. " * 150
             + "END MARKER."
         )
 
@@ -840,16 +1003,39 @@ class DocumentFormatTests(unittest.TestCase):
         )
         reader = PdfReader(io.BytesIO(output))
         visible = "".join(page.extract_text() or "" for page in reader.pages)
+        rendered_sizes = []
 
-        self.assertGreater(len(reader.pages), 3)
+        def capture_size(text, _cm, _tm, _font, font_size):
+            if "A long translated unit" in str(text or ""):
+                rendered_sizes.append(float(font_size))
+
+        reader.pages[0].extract_text(visitor_text=capture_size)
+
+        self.assertEqual(len(reader.pages), 3)
         self.assertEqual(
             reader.metadata.subject,
-            "Reflowed translation generated from a text-layer PDF",
+            "Layout-preserving translation generated from a text-layer PDF",
         )
         self.assertIn("END MARKER.", visible)
         self.assertIn("Normal translation 32.", visible)
+        self.assertTrue(rendered_sizes)
+        self.assertLess(min(rendered_sizes), 5.5)
 
-    def test_pdf_form_text_uses_safe_reflow_fallback(self):
+    def test_pdf_strict_layout_refuses_to_reflow_when_text_cannot_fit(self):
+        source = make_pdf()
+        source_units = extract_binary_text("pdf", source).split("\n")
+        translations = ["Normal translation." for _ in source_units]
+        translations[0] = "Unreasonably long translation. " * 900
+
+        with self.assertRaisesRegex(DocumentFormatError, "第 1 页.*不会重排"):
+            build_binary_output(
+                "pdf",
+                source,
+                "\n".join(translations),
+                target_language="英文",
+            )
+
+    def test_pdf_unmapped_form_text_is_preserved_without_reflowing_the_page(self):
         from reportlab.pdfgen.canvas import Canvas
         from pypdf import PdfReader
 
@@ -873,13 +1059,61 @@ class DocumentFormatTests(unittest.TestCase):
         reader = PdfReader(io.BytesIO(output))
         self.assertEqual(
             reader.metadata.subject,
-            "Reflowed translation generated from a text-layer PDF",
+            "Layout-preserving translation generated from a text-layer PDF",
         )
         visible = "".join(page.extract_text() or "" for page in reader.pages)
-        self.assertEqual(visible.strip(), "Translated direct text.")
-        self.assertNotIn("form object", visible)
+        self.assertIn("Translated direct text.", visible)
+        self.assertIn("Text inside a form object.", visible)
 
-    def test_pdf_invisible_ocr_text_uses_safe_reflow_fallback(self):
+    def test_pdf_page_range_does_not_modify_shared_forms_on_other_pages(self):
+        from reportlab.pdfgen.canvas import Canvas
+        from pypdf import PdfReader
+
+        source_buffer = io.BytesIO()
+        pdf = Canvas(source_buffer, invariant=1)
+        pdf.beginForm("shared")
+        pdf.setFont("Helvetica", 12)
+        pdf.drawString(0, 0, "Shared form label.")
+        pdf.endForm()
+        pdf.setFont("Helvetica", 12)
+        pdf.drawString(72, 720, "First page body.")
+        pdf.saveState()
+        pdf.translate(72, 680)
+        pdf.doForm("shared")
+        pdf.restoreState()
+        pdf.showPage()
+        pdf.setFont("Helvetica", 12)
+        pdf.drawString(72, 720, "Second page body.")
+        pdf.saveState()
+        pdf.translate(72, 680)
+        pdf.doForm("shared")
+        pdf.restoreState()
+        pdf.save()
+        source = source_buffer.getvalue()
+        selected = extract_binary_text("pdf", source, 1, 1)
+        translations = "\n".join(
+            f"Selected translation {index}."
+            for index, _ in enumerate(selected.split("\n"), 1)
+        )
+
+        output = build_binary_output(
+            "pdf",
+            source,
+            translations,
+            target_language="英文",
+            pdf_page_start=1,
+            pdf_page_end=1,
+        )
+        reader = PdfReader(io.BytesIO(output))
+        first = reader.pages[0].extract_text() or ""
+        second = reader.pages[1].extract_text() or ""
+
+        self.assertNotIn("First page body.", first)
+        self.assertIn("Selected translation 1.", first)
+        self.assertIn("Second page body.", second)
+        self.assertIn("Shared form label.", second)
+
+    def test_pdf_invisible_ocr_text_requires_disabling_strict_layout(self):
         from reportlab.pdfgen.canvas import Canvas
         from pypdf import PdfReader
 
@@ -896,11 +1130,16 @@ class DocumentFormatTests(unittest.TestCase):
             extract_binary_text("pdf", source_buffer.getvalue()),
             "Invisible OCR text.",
         )
+        with self.assertRaisesRegex(DocumentFormatError, "第 1 页.*不会重排"):
+            build_binary_output(
+                "pdf",
+                source_buffer.getvalue(),
+                "Visible translated text.",
+                target_language="英文",
+            )
         output = build_binary_output(
-            "pdf",
-            source_buffer.getvalue(),
-            "Visible translated text.",
-            target_language="英文",
+            "pdf", source_buffer.getvalue(), "Visible translated text.",
+            target_language="英文", pdf_strict_layout=False,
         )
         reader = PdfReader(io.BytesIO(output))
         self.assertEqual(
@@ -908,6 +1147,121 @@ class DocumentFormatTests(unittest.TestCase):
             "Reflowed translation generated from a text-layer PDF",
         )
         self.assertEqual(reader.pages[0].extract_text().strip(), "Visible translated text.")
+
+    def test_pdf_clip_only_art_page_is_preserved_and_not_sent_for_translation(self):
+        from reportlab.pdfgen.canvas import Canvas
+        from pypdf import PdfReader
+
+        source_buffer = io.BytesIO()
+        pdf = Canvas(source_buffer, pagesize=(600, 400), invariant=1)
+        art = pdf.beginText(330, 240)
+        art.setFont("Helvetica-Bold", 42)
+        art.setTextRenderMode(7)
+        art.textLine("C A L L")
+        pdf.drawText(art)
+        pdf.setFillColorRGB(0.15, 0.45, 0.75)
+        pdf.rect(300, 180, 260, 120, fill=1, stroke=0)
+        pdf.showPage()
+        pdf.setFont("Helvetica", 12)
+        pdf.drawString(72, 320, "Ordinary body text.")
+        pdf.save()
+        source = source_buffer.getvalue()
+
+        self.assertEqual(extract_binary_text("pdf", source), "Ordinary body text.")
+        output = build_binary_output(
+            "pdf", source, "Translated ordinary body text.", target_language="英文"
+        )
+        source_reader = PdfReader(io.BytesIO(source))
+        output_reader = PdfReader(io.BytesIO(output))
+        self.assertEqual(len(output_reader.pages), 2)
+        self.assertEqual(
+            output_reader.pages[0].get_contents().get_data(),
+            source_reader.pages[0].get_contents().get_data(),
+        )
+        self.assertIn(
+            "Translated ordinary body text.", output_reader.pages[1].extract_text()
+        )
+
+    def test_pdf_box_order_resets_columns_after_a_vertical_panel_gap(self):
+        def box(text, x0, x1, top, bottom):
+            return {
+                "text": text,
+                "x0": x0,
+                "x1": x1,
+                "top": top,
+                "bottom": bottom,
+            }
+
+        boxes = [
+            box("Lower right body", 312, 530, 460, 540),
+            box("Upper right continuation", 312, 530, 150, 240),
+            box("Upper left opening", 72, 290, 150, 204),
+            box("Lower left dice rules", 72, 290, 400, 540),
+            box("Upper left story", 72, 290, 219, 340),
+            box("Full-width heading", 165, 435, 100, 130),
+            box("Upper right ending", 312, 530, 245, 340),
+            box("Lower right heading", 354, 486, 430, 450),
+        ]
+
+        ordered = document_formats._pdfplumber_order_boxes(boxes, 600, 800)
+        self.assertEqual(
+            [entry["text"] for entry in ordered],
+            [
+                "Full-width heading",
+                "Upper left opening",
+                "Upper left story",
+                "Upper right continuation",
+                "Upper right ending",
+                "Lower left dice rules",
+                "Lower right heading",
+                "Lower right body",
+            ],
+        )
+        units = [
+            {
+                "text": entry["text"],
+                "heading": entry["text"] == "Full-width heading",
+                "reading": entry["_translation_reading"],
+                "box": {"font_size": 10.0},
+            }
+            for entry in ordered
+        ]
+        hints = document_formats._pdf_continuation_hints([
+            {"page_number": 1, "units": units}
+        ])
+        self.assertEqual(hints[3], "strong")
+        self.assertEqual(hints[5], "separate")
+
+    def test_pdf_cropbox_excludes_hidden_spread_half_and_keeps_original_geometry(self):
+        from reportlab.pdfgen.canvas import Canvas
+        from pypdf import PdfReader, PdfWriter
+        from pypdf.generic import RectangleObject
+
+        source_buffer = io.BytesIO()
+        pdf = Canvas(source_buffer, pagesize=(600, 400), invariant=1)
+        pdf.setFont("Helvetica", 12)
+        pdf.drawString(50, 320, "Hidden back-cover paragraph.")
+        pdf.drawString(350, 250, "Visible cover subtitle.")
+        pdf.save()
+
+        reader = PdfReader(io.BytesIO(source_buffer.getvalue()))
+        reader.pages[0].cropbox = RectangleObject((300, 0, 600, 400))
+        writer = PdfWriter()
+        writer.add_page(reader.pages[0])
+        cropped_buffer = io.BytesIO()
+        writer.write(cropped_buffer)
+        source = cropped_buffer.getvalue()
+
+        self.assertEqual(extract_binary_text("pdf", source), "Visible cover subtitle.")
+        output = build_binary_output(
+            "pdf", source, "Translated visible subtitle.", target_language="英文"
+        )
+        output_page = PdfReader(io.BytesIO(output)).pages[0]
+        self.assertEqual(tuple(output_page.mediabox), (0, 0, 600, 400))
+        self.assertEqual(tuple(output_page.cropbox), (300, 0, 600, 400))
+        extracted = output_page.extract_text()
+        self.assertIn("Translated visible subtitle.", extracted)
+        self.assertNotIn("Hidden back-cover paragraph.", extracted)
 
     def test_pdf_safe_layout_preserves_images_and_links(self):
         from PIL import Image
@@ -990,6 +1344,53 @@ class DocumentFormatTests(unittest.TestCase):
             finally:
                 app.OUTPUTS_DIR, app.OUTPUT_INDEX_PATH, app.SOURCE_CACHE_DIR = original_paths
 
+    def test_pdf_output_metadata_keeps_selected_page_range(self):
+        source = make_pdf()
+        original_paths = (
+            app.OUTPUTS_DIR,
+            app.OUTPUT_INDEX_PATH,
+            app.SOURCE_CACHE_DIR,
+        )
+        with tempfile.TemporaryDirectory() as root:
+            try:
+                app.OUTPUTS_DIR = os.path.join(root, "outputs")
+                app.OUTPUT_INDEX_PATH = os.path.join(root, "state.json")
+                app.SOURCE_CACHE_DIR = os.path.join(root, "sources")
+                imported = cache_binary_source(
+                    app.SOURCE_CACHE_DIR, "range.pdf", source
+                )
+                selected = extract_binary_text("pdf", source, 2, 2)
+                translations = "\n".join(
+                    f"Range translation {index}."
+                    for index, _ in enumerate(selected.split("\n"), 1)
+                )
+                file_info = {
+                    "name": "range.pdf",
+                    **imported,
+                    "content": selected,
+                    "pdf_page_start": 2,
+                    "pdf_page_end": 2,
+                    "pdf_page_selection": "2",
+                }
+
+                output_name = app.save_translation_output(
+                    file_info, translations, "英文"
+                )
+                metadata = app._read_output_index()[output_name]
+
+                self.assertEqual(metadata["pdf_page_count"], 3)
+                self.assertEqual(metadata["pdf_page_start"], 2)
+                self.assertEqual(metadata["pdf_page_end"], 2)
+                self.assertEqual(metadata["pdf_page_selection"], "2")
+                self.assertTrue(metadata["pdf_strict_layout"])
+                self.assertEqual(
+                    metadata["pdf_extraction_version"],
+                    document_formats.PDF_EXTRACTION_VERSION,
+                )
+                self.assertEqual(metadata["preview_content"], translations)
+            finally:
+                app.OUTPUTS_DIR, app.OUTPUT_INDEX_PATH, app.SOURCE_CACHE_DIR = original_paths
+
     def test_pdf_import_preview_and_download_api(self):
         source = make_pdf()
         original_paths = (
@@ -1022,6 +1423,64 @@ class DocumentFormatTests(unittest.TestCase):
                 imported = json.loads(response.read().decode("utf-8"))
                 self.assertEqual(response.status, 200)
                 self.assertEqual(imported["source_format"], "pdf")
+                self.assertEqual(imported["pdf_page_count"], 3)
+                self.assertEqual(imported["pdf_page_start"], 1)
+                self.assertEqual(imported["pdf_page_end"], 3)
+                self.assertEqual(imported["pdf_page_selection"], "all")
+                self.assertEqual(
+                    imported["pdf_extraction_version"],
+                    document_formats.PDF_EXTRACTION_VERSION,
+                )
+
+                connection.request(
+                    "GET",
+                    "/api/source?id=" + imported["source_id"]
+                    + "&format=pdf&sha256=" + imported["source_sha256"]
+                    + "&page_start=2&page_end=2",
+                )
+                response = connection.getresponse()
+                ranged = json.loads(response.read().decode("utf-8"))
+                self.assertEqual(response.status, 200)
+                self.assertEqual(ranged["pdf_page_count"], 3)
+                self.assertEqual(ranged["pdf_page_start"], 2)
+                self.assertEqual(ranged["pdf_page_end"], 2)
+                self.assertEqual(ranged["pdf_page_selection"], "2")
+                self.assertEqual(
+                    ranged["pdf_extraction_version"],
+                    document_formats.PDF_EXTRACTION_VERSION,
+                )
+                self.assertEqual(
+                    ranged["content"], extract_binary_text("pdf", source, 2, 2)
+                )
+
+                connection.request(
+                    "GET",
+                    "/api/source?id=" + imported["source_id"]
+                    + "&format=pdf&sha256=" + imported["source_sha256"]
+                    + "&pages=1,3",
+                )
+                response = connection.getresponse()
+                sparse = json.loads(response.read().decode("utf-8"))
+                self.assertEqual(response.status, 200)
+                self.assertEqual(sparse["pdf_page_selection"], "1,3")
+                self.assertEqual(sparse["pdf_page_start"], 1)
+                self.assertEqual(sparse["pdf_page_end"], 3)
+                self.assertEqual(
+                    sparse["content"],
+                    extract_binary_text(
+                        "pdf", source, pdf_page_selection="1,3"
+                    ),
+                )
+
+                connection.request(
+                    "GET",
+                    "/api/source?id=" + imported["source_id"]
+                    + "&format=pdf&sha256=" + imported["source_sha256"]
+                    + "&page_start=4&page_end=4",
+                )
+                response = connection.getresponse()
+                response.read()
+                self.assertEqual(response.status, 400)
 
                 translations = "\n".join(
                     f"API translation {index}."

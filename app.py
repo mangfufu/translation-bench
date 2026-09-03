@@ -27,6 +27,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from document_formats import (
     BINARY_EXTENSIONS,
+    PDF_EXTRACTION_VERSION,
     DocumentFormatError,
     binary_digest,
     build_binary_output,
@@ -34,8 +35,12 @@ from document_formats import (
     delete_binary_source,
     document_extension,
     extract_binary_text,
+    extract_pdf_translation_data,
+    format_pdf_page_selection,
     is_binary_document,
     load_binary_source,
+    normalize_pdf_page_selection,
+    pdf_page_count,
 )
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -89,6 +94,7 @@ DEFAULT_CONFIG = {
     "top_p": 0.6,
     "repeat_penalty": 1.05,
     "enable_thinking": False,     # 翻译默认关闭思考模式，避免额外推理和输出污染
+    "pdf_strict_layout": True,    # PDF 默认只原位替换，禁止自动重排页面
     "context_mode": "full",      # full=尽量全文，neighbor=邻近上下文，unit=独立单元
     "context_units": 12,          # 最近确认译文单元；长文窗口也用作前向重叠
     "future_context_units": 6,    # 长文固定窗口向后的完整单元重叠
@@ -105,7 +111,8 @@ BASE_SYSTEM_PROMPT = (
     "【硬性规则】\n"
     "1. 忠实、完整地翻译，不得省略、概括、捏造内容或额外解释。\n"
     "2. 只输出当前待译单元的译文，不输出说明、标签、定位键或原文。\n"
-    "3. 当前单元必须独立、完整对应；单元内部不要自行换行。\n"
+    "3. 当前单元可能在句中截断。不得补写前后文；承接上文时不得重复已有内容；"
+    "相邻译文拼接后应连贯。单元内部不要自行换行。\n"
     "4. 结合参考上下文统一术语、专名、称谓和语气，但不得重复输出参考内容。\n"
     "5. 原样保留 URL、行内代码、变量、占位符、数字、Markdown 行内标记及字幕内联标签。"
 )
@@ -206,7 +213,9 @@ def enqueue_job_event(job, event):
         pass
 
 
-def save_translation_output(file_info, translated_content, target_language):
+def save_translation_output(
+    file_info, translated_content, target_language, pdf_strict_layout=True,
+):
     """按源格式保存译文；二进制容器从缓存原文重建。"""
     name = file_info["name"]
     output_name = output_filename(name, target_language)
@@ -234,6 +243,10 @@ def save_translation_output(file_info, translated_content, target_language):
             translated_content,
             document_title=output_name,
             target_language=target_language,
+            pdf_page_start=file_info.get("pdf_page_start"),
+            pdf_page_end=file_info.get("pdf_page_end"),
+            pdf_page_selection=file_info.get("pdf_page_selection"),
+            pdf_strict_layout=pdf_strict_layout,
         )
         digest = binary_digest(source_data)
     else:
@@ -263,9 +276,24 @@ def save_translation_output(file_info, translated_content, target_language):
         "output_name": output_name,
     }
     if source_format == "pdf":
-        # 重排后的 PDF 视觉换行不等于翻译单元边界。把无格式预览集中
-        # 放在状态文件中，恢复页面时仍可与原文稳定一一对应。
+        # PDF 视觉换行不等于翻译单元边界。把无格式预览集中放在状态
+        # 文件中，恢复页面时仍可与原文稳定一一对应。
         metadata["preview_content"] = translated_content
+        count = int(file_info.get("pdf_page_count") or pdf_page_count(source_data))
+        selected_pages = normalize_pdf_page_selection(
+            count,
+            file_info.get("pdf_page_selection"),
+            file_info.get("pdf_page_start"),
+            file_info.get("pdf_page_end"),
+        )
+        metadata["pdf_page_count"] = count
+        metadata["pdf_page_start"] = selected_pages[0]
+        metadata["pdf_page_end"] = selected_pages[-1]
+        metadata["pdf_page_selection"] = format_pdf_page_selection(
+            selected_pages, count
+        )
+        metadata["pdf_extraction_version"] = PDF_EXTRACTION_VERSION
+        metadata["pdf_strict_layout"] = bool(pdf_strict_layout)
     save_output_metadata(metadata)
     return output_name
 
@@ -459,6 +487,11 @@ class ModelServiceError(RuntimeError):
         self.transient = status in TRANSIENT_HTTP_STATUS
         self.retry_after = retry_after
 
+
+class OutputLengthError(RuntimeError):
+    """模型输出已占满当前上下文允许的全部生成空间。"""
+
+
 class Translator:
     def __init__(self, config):
         self.cfg = {**DEFAULT_CONFIG, **(config or {})}
@@ -616,7 +649,10 @@ class Translator:
 
     def _output_token_budget(self, text):
         """为完整译文留出足够空间，也限制模型跑偏时的无限生成。"""
-        return min(80000, max(256, int(self._estimate_tokens(text) * 1.5) + 256))
+        # 拉丁字母语言译成中日韩文字时，源文 token 密度较低，而译文
+        # token 密度明显更高。1.5 倍在长 PDF 文本块上容易正常翻到一半
+        # 就命中 length；这里宁可多预留一些，本地推理只按实际生成量运行。
+        return min(80000, max(384, int(self._estimate_tokens(text) * 2.25) + 384))
 
     def _complete_prompt(
         self, prompt, max_tokens, on_stream=None, retry_on_length=True,
@@ -642,6 +678,15 @@ class Translator:
         self._last_completion_error = None
         retryable = True
         attempts = max(1, int(cfg.get("max_retries", 5)))
+        context_size = max(2048, int(cfg.get("context_size", 65536)))
+        estimated_prompt = (
+            self._estimate_tokens(sys_prompt)
+            + self._estimate_tokens(prompt)
+            + 128
+        )
+        max_tokens_limit = max(
+            int(max_tokens), context_size - estimated_prompt - 96
+        )
 
         for attempt in range(attempts):
             request_id = next_model_log_id()
@@ -676,7 +721,21 @@ class Translator:
                 )
                 response_logged = True
                 if choice.get("finish_reason") == "length" and retry_on_length:
-                    raise RuntimeError("译文达到 max_tokens，输出被截断")
+                    current_budget = int(payload["max_tokens"])
+                    expanded_budget = min(
+                        max_tokens_limit,
+                        max(current_budget + 256, int(current_budget * 1.75)),
+                    )
+                    if attempt + 1 < attempts and expanded_budget > current_budget:
+                        payload["max_tokens"] = expanded_budget
+                        terminal_model_log(
+                            f"模型请求 #{request_id} 输出空间不足",
+                            f"max_tokens 将从 {current_budget} 提高到 {expanded_budget} 后立即重试",
+                        )
+                        continue
+                    raise OutputLengthError(
+                        f"译文达到 max_tokens={current_budget}，且没有更多上下文空间可用于完整输出"
+                    )
                 return True, output
             except Exception as exc:
                 last = exc
@@ -692,7 +751,10 @@ class Translator:
                 )
                 if self._interrupt_event.is_set():
                     return False, "任务已中断"
-                retryable = not isinstance(exc, ModelServiceError) or exc.transient
+                retryable = (
+                    not isinstance(exc, OutputLengthError)
+                    and (not isinstance(exc, ModelServiceError) or exc.transient)
+                )
                 if not retryable or attempt + 1 >= attempts:
                     break
                 retry_after = getattr(exc, "retry_after", None)
@@ -707,6 +769,7 @@ class Translator:
         self, text, context_before="", context_after="",
         previous_translation="", retranslate=False, on_stream=None,
         source_language=None, reference_text="", reference_kind="全文原文",
+        continuation_mode="",
     ):
         """翻译一段文本, 返回 (成功, 结果/错误)。"""
         cfg = self.cfg
@@ -725,6 +788,21 @@ class Translator:
         tgt = cfg.get("tgt_lang", "中文")
         if src == "自动判断":
             src = detect_lang(text)
+        if continuation_mode == "strong":
+            continuation_instruction = (
+                "【跨单元衔接提示】\n"
+                "版面结构表明当前原文是上一单元同一句话的后半段。只译当前实际出现的内容，"
+                "直接承接上一段译文；不要重复上一段已有的主语、动作或修饰语，也不要补成独立句。\n\n"
+            )
+        elif continuation_mode == "possible":
+            continuation_instruction = (
+                "【单元边界判断】\n"
+                "当前原文可能是上一单元的后半句，也可能只是没有规范标点的新段落。"
+                "请结合最近原文和已确认译文判断：若为续句，只译当前实际内容并直接衔接，"
+                "不得重复上文；若为新段落，则正常完整翻译。不得仅因缺少标点而省略主语或信息。\n\n"
+            )
+        else:
+            continuation_instruction = ""
         if reference_text or context_before or context_after or retranslate:
             references = []
             if reference_text:
@@ -761,6 +839,7 @@ class Translator:
                     "单段译文内部不要自行换行。\n\n"
                     + (context_text + "\n\n" if context_text else "")
                     + previous_block
+                    + ("\n\n" + continuation_instruction.rstrip() if continuation_instruction else "")
                     + f"\n\n【当前待译文本（{src} → {tgt}）】\n{text}"
                 )
             else:
@@ -768,13 +847,15 @@ class Translator:
                     "以下固定参考和已确认译文只用于理解语境、消除歧义并统一术语、称谓和语气。\n"
                     "只翻译【当前待译文本】，不得翻译、续写或输出任何前文和下文参考。\n\n"
                     + context_text
+                    + ("\n\n" + continuation_instruction.rstrip() if continuation_instruction else "")
                     + f"\n\n【当前待译文本（{src} → {tgt}）】\n{text}"
                 )
         else:
             prompt = (
                 "只翻译【当前待译文本】，只输出对应译文，不得输出说明、标签或原文；"
                 "单元内部不要自行换行。"
-                f"\n\n【当前待译文本（{src} → {tgt}）】\n{text}"
+                + ("\n\n" + continuation_instruction.rstrip() if continuation_instruction else "")
+                + f"\n\n【当前待译文本（{src} → {tgt}）】\n{text}"
             )
         return self._complete_prompt(prompt, max_tokens, on_stream)
 
@@ -801,7 +882,13 @@ class Translator:
         ]
         if source_units:
             largest_input = max(self._estimate_tokens(unit) for unit in source_units)
-            largest_output = max(self._output_token_budget(unit) for unit in source_units)
+            # 参考窗口规划保留一个常规译文预算即可；真正请求若遇到
+            # length 会动态扩容。直接按最坏输出预留会让小上下文模式
+            # 完全失去前后文。
+            largest_output = max(
+                max(256, int(self._estimate_tokens(unit) * 1.5) + 256)
+                for unit in source_units
+            )
         else:
             largest_input = 1
             largest_output = 256
@@ -995,6 +1082,34 @@ class Translator:
         return separator.join(part.strip() for part in parts if part.strip())
 
     @staticmethod
+    def _text_continuation_mode(previous_source, current_source):
+        """文字线索只能表示可能衔接，不能替版面结构作出确认。"""
+        previous = str(previous_source or "").strip()
+        current = str(current_source or "").lstrip()
+        if not previous or not current:
+            return ""
+        current = re.sub(r"^[\"'“”‘’([{]+", "", current)
+        previous_core = re.sub(r"[\s\"'”’」』）)\]]+$", "", previous)
+        if re.search(r"[.!?。！？…]$", previous_core):
+            return ""
+        if re.match(r"[a-z\u00e0-\u00f6\u00f8-\u00ff]", current):
+            return "possible"
+        if previous.endswith(("-", "–", "—", ",", ";")):
+            return "possible"
+        return ""
+
+    @staticmethod
+    def _continuation_hint_for_line(hints, line_index):
+        """Read a trusted line-aligned hint without accepting arbitrary values."""
+        value = None
+        if isinstance(hints, (list, tuple)):
+            if 0 <= int(line_index) < len(hints):
+                value = hints[int(line_index)]
+        elif isinstance(hints, dict):
+            value = hints.get(str(line_index), hints.get(int(line_index)))
+        return value if value in {"strong", "possible", "separate"} else None
+
+    @staticmethod
     def _plain_unit(line):
         """保留纯文本行首尾空白，把中间正文作为可翻译内容。"""
         plain = re.match(r"^(\s*)(.*?)([ \t]*)$", line)
@@ -1109,7 +1224,7 @@ class Translator:
     def translate_batch(
         self, paras, history=None, future=None, previous_translations=None,
         preview=None, source_language=None, reference_text="",
-        reference_kind="全文原文参考",
+        reference_kind="全文原文参考", continuation_hint=None,
     ):
         """逐段翻译；每个模型请求只对应一个由程序确定的位置。"""
         history = history if isinstance(history, list) else list(history or [])
@@ -1124,6 +1239,17 @@ class Translator:
             translated_units = []
             for unit_pos, source_unit in enumerate(source_units):
                 unit_future = source_units[unit_pos + 1:] + paras[pos + 1:] + future
+                previous_source = history[-1][0] if history else ""
+                if unit_pos == 0 and continuation_hint in {
+                    "strong", "possible", "separate",
+                }:
+                    continuation_mode = (
+                        "" if continuation_hint == "separate" else continuation_hint
+                    )
+                else:
+                    continuation_mode = self._text_continuation_mode(
+                        previous_source, source_unit
+                    )
 
                 def stream_unit(accumulated, current_pos=pos):
                     if accumulated and preview:
@@ -1139,9 +1265,16 @@ class Translator:
                     if len(source_units) == 1 and pos < len(previous_translations)
                     else ""
                 )
+                context_before = self._context_text(history)
+                if continuation_mode and not context_before and history:
+                    previous_source_text, previous_translated_text = history[-1]
+                    context_before = (
+                        f"[原文]\n{previous_source_text}\n"
+                        f"[译文]\n{previous_translated_text}"
+                    )
                 ok2, o2 = self.translate_text(
                     source_unit,
-                    self._context_text(history),
+                    context_before,
                     "" if reference_text else self._future_context_text(unit_future),
                     previous,
                     is_retranslation,
@@ -1149,6 +1282,7 @@ class Translator:
                     source_language,
                     reference_text,
                     reference_kind,
+                    continuation_mode,
                 )
                 if not ok2:
                     return False, o2
@@ -1211,7 +1345,10 @@ class Translator:
             text = text[:-len(suffix)]
         return text.strip()
 
-    def retranslate_line(self, content, translated_content, line_index, filename=""):
+    def retranslate_line(
+        self, content, translated_content, line_index, filename="",
+        continuation_hints=None,
+    ):
         """使用文件上下文重译一个物理行，返回 (新行, 更新后的完整译文)。"""
         content = normalize_text_content(content)[0]
         translated_content = normalize_text_content(translated_content)[0]
@@ -1268,6 +1405,9 @@ class Translator:
             ),
             reference_text=reference["text"],
             reference_kind=reference["kind"],
+            continuation_hint=self._continuation_hint_for_line(
+                continuation_hints, line_index
+            ),
         )
         if not ok:
             return False, translated
@@ -1279,6 +1419,7 @@ class Translator:
     def translate_content(
         self, content, filename="", emit=None, progress=None,
         previous_content=None, resume_lines=None, checkpoint=None,
+        continuation_hints=None,
     ):
         """翻译文件内容，逐个物理位置生成并保持 Markdown 结构。"""
         content = normalize_text_content(content)[0]
@@ -1359,6 +1500,9 @@ class Translator:
                 document_source,
                 reference["text"],
                 reference["kind"],
+                self._continuation_hint_for_line(
+                    continuation_hints, line_index
+                ),
             )
             if not ok:
                 return False, translated
@@ -1440,6 +1584,7 @@ def run_job(job_id):
                     previous_content=previous_content,
                     resume_lines=files[idx].get("resume_lines"),
                     checkpoint=checkpoint_line,
+                    continuation_hints=files[idx].get("continuation_hints"),
                 )
                 if job.get("interrupt") or translator.interrupted:
                     # 中断只停止当前模型请求；已流式显示的内容继续保留，
@@ -1450,7 +1595,12 @@ def run_job(job_id):
                     emit("fail", file=name, msg=out)
                 else:
                     target = cfg.get("tgt_lang", "中文")
-                    out_name = save_translation_output(files[idx], out, target)
+                    out_name = save_translation_output(
+                        files[idx],
+                        out,
+                        target,
+                        pdf_strict_layout=cfg.get("pdf_strict_layout", True),
+                    )
                     job["results"].append({
                         "name": name, "output_name": out_name,
                         "target_language": target, "status": "ok", "content": out,
@@ -1584,6 +1734,10 @@ def job_status_snapshot(job_id, requested_full=False):
                     "source_id": item.get("source_id"),
                     "source_format": item.get("source_format", "text"),
                     "source_sha256": item.get("source_sha256"),
+                    "pdf_page_count": item.get("pdf_page_count"),
+                    "pdf_page_start": item.get("pdf_page_start"),
+                    "pdf_page_end": item.get("pdf_page_end"),
+                    "pdf_page_selection": item.get("pdf_page_selection"),
                     "text_eol": item.get("text_eol", "lf"),
                     "text_bom": bool(item.get("text_bom", False)),
                 }
@@ -1713,20 +1867,56 @@ class Handler(BaseHTTPRequestHandler):
             source_id = query.get("id", [""])[0]
             source_format = query.get("format", [""])[0]
             source_sha256 = query.get("sha256", [""])[0]
+            requested_page_start = query.get("page_start", [None])[0]
+            requested_page_end = query.get("page_end", [None])[0]
+            requested_page_selection = query.get("pages", [None])[0]
             try:
                 data = load_binary_source(
                     SOURCE_CACHE_DIR, source_id, source_format, source_sha256
                 )
-                content = extract_binary_text(source_format, data)
             except (DocumentFormatError, OSError) as exc:
                 self._send_json({"error": str(exc)}, 404)
                 return
-            self._send_json({
+            try:
+                if str(source_format).lower().lstrip(".") == "pdf":
+                    page_count = pdf_page_count(data)
+                    selected_pages = normalize_pdf_page_selection(
+                        page_count,
+                        requested_page_selection,
+                        requested_page_start,
+                        requested_page_end,
+                    )
+                    page_selection = format_pdf_page_selection(
+                        selected_pages, page_count
+                    )
+                    page_start = selected_pages[0]
+                    page_end = selected_pages[-1]
+                    content = extract_binary_text(
+                        source_format,
+                        data,
+                        pdf_page_selection=page_selection,
+                    )
+                else:
+                    page_count = page_start = page_end = page_selection = None
+                    content = extract_binary_text(source_format, data)
+            except (DocumentFormatError, OSError, ValueError) as exc:
+                self._send_json({"error": str(exc)}, 400)
+                return
+            result = {
                 "ok": True,
                 "content": content,
                 "source_format": source_format,
                 "source_sha256": binary_digest(data),
-            })
+            }
+            if page_count is not None:
+                result.update({
+                    "pdf_page_count": page_count,
+                    "pdf_page_start": page_start,
+                    "pdf_page_end": page_end,
+                    "pdf_page_selection": page_selection,
+                    "pdf_extraction_version": PDF_EXTRACTION_VERSION,
+                })
+            self._send_json(result)
         elif path == "/api/history":
             files_list = []
             with OUTPUT_INDEX_LOCK:
@@ -1742,6 +1932,12 @@ class Handler(BaseHTTPRequestHandler):
                             "source_sha256": meta.get("source_sha256"),
                             "source_format": meta.get("source_format", "text"),
                             "target_language": meta.get("target_language"),
+                            "pdf_page_count": meta.get("pdf_page_count"),
+                            "pdf_page_start": meta.get("pdf_page_start"),
+                            "pdf_page_end": meta.get("pdf_page_end"),
+                            "pdf_page_selection": meta.get("pdf_page_selection"),
+                            "pdf_extraction_version": meta.get("pdf_extraction_version"),
+                            "pdf_strict_layout": meta.get("pdf_strict_layout"),
                         })
                         files_list.append(entry)
             self._send_json({"files": files_list})
@@ -2043,15 +2239,24 @@ class Handler(BaseHTTPRequestHandler):
             updated_content = "\n".join(translated_lines)
             target = cfg.get("tgt_lang", "中文")
             try:
-                out_name = save_translation_output({
-                    "name": name,
-                    "content": content,
-                    "source_id": source_id,
-                    "source_format": source_format,
-                    "source_sha256": source_sha256,
-                    "text_eol": text_eol,
-                    "text_bom": text_bom,
-                }, updated_content, target)
+                out_name = save_translation_output(
+                    {
+                        "name": name,
+                        "content": content,
+                        "source_id": source_id,
+                        "source_format": source_format,
+                        "source_sha256": source_sha256,
+                        "pdf_page_count": body.get("pdf_page_count"),
+                        "pdf_page_start": body.get("pdf_page_start"),
+                        "pdf_page_end": body.get("pdf_page_end"),
+                        "pdf_page_selection": body.get("pdf_page_selection"),
+                        "text_eol": text_eol,
+                        "text_bom": text_bom,
+                    },
+                    updated_content,
+                    target,
+                    pdf_strict_layout=cfg.get("pdf_strict_layout", True),
+                )
             except (OSError, DocumentFormatError) as exc:
                 self._send_json({"error": f"保存编辑失败: {exc}"}, 500)
                 return
@@ -2095,10 +2300,39 @@ class Handler(BaseHTTPRequestHandler):
             text_eol = _text_eol(body.get("text_eol"), detected_eol)
             text_bom = bool(body.get("text_bom", detected_bom))
 
+            continuation_hints = None
+            if str(source_format).lower().lstrip(".") == "pdf":
+                try:
+                    source_data = load_binary_source(
+                        SOURCE_CACHE_DIR, source_id, "pdf", source_sha256
+                    )
+                    count = pdf_page_count(source_data)
+                    selected_pages = normalize_pdf_page_selection(
+                        count,
+                        body.get("pdf_page_selection"),
+                        body.get("pdf_page_start"),
+                        body.get("pdf_page_end"),
+                    )
+                    extracted_pdf = extract_pdf_translation_data(
+                        source_data,
+                        page_selection=format_pdf_page_selection(
+                            selected_pages, count
+                        ),
+                    )
+                    if extracted_pdf["content"] != content:
+                        raise DocumentFormatError(
+                            "PDF 页码选择与原文预览不一致，请重新选择页面"
+                        )
+                    continuation_hints = extracted_pdf["continuation_hints"]
+                except (DocumentFormatError, OSError) as exc:
+                    self._send_json({"error": str(exc)}, 400)
+                    return
+
             translator = Translator(cfg)
             try:
                 ok, result = translator.retranslate_line(
-                    content, translated_content, line_index, name
+                    content, translated_content, line_index, name,
+                    continuation_hints=continuation_hints,
                 )
             except ValueError as exc:
                 self._send_json({"error": str(exc)}, 400)
@@ -2112,15 +2346,24 @@ class Handler(BaseHTTPRequestHandler):
             output_line, updated_content = result
             target = cfg.get("tgt_lang", "中文")
             try:
-                out_name = save_translation_output({
-                    "name": name,
-                    "content": content,
-                    "source_id": source_id,
-                    "source_format": source_format,
-                    "source_sha256": source_sha256,
-                    "text_eol": text_eol,
-                    "text_bom": text_bom,
-                }, updated_content, target)
+                out_name = save_translation_output(
+                    {
+                        "name": name,
+                        "content": content,
+                        "source_id": source_id,
+                        "source_format": source_format,
+                        "source_sha256": source_sha256,
+                        "pdf_page_count": body.get("pdf_page_count"),
+                        "pdf_page_start": body.get("pdf_page_start"),
+                        "pdf_page_end": body.get("pdf_page_end"),
+                        "pdf_page_selection": body.get("pdf_page_selection"),
+                        "text_eol": text_eol,
+                        "text_bom": text_bom,
+                    },
+                    updated_content,
+                    target,
+                    pdf_strict_layout=cfg.get("pdf_strict_layout", True),
+                )
             except (OSError, DocumentFormatError) as exc:
                 self._send_json({"error": f"保存重译结果失败: {exc}"}, 500)
                 return
@@ -2230,12 +2473,39 @@ class Handler(BaseHTTPRequestHandler):
                         raise DocumentFormatError(
                             f"{file_info['name']} 缺少二进制原文，请重新添加文件"
                         )
-                    load_binary_source(
+                    source_data = load_binary_source(
                         SOURCE_CACHE_DIR,
                         file_info.get("source_id"),
                         source_format,
                         file_info.get("source_sha256", ""),
                     )
+                    if source_format == "pdf":
+                        count = pdf_page_count(source_data)
+                        selected_pages = normalize_pdf_page_selection(
+                            count,
+                            file_info.get("pdf_page_selection"),
+                            file_info.get("pdf_page_start"),
+                            file_info.get("pdf_page_end"),
+                        )
+                        page_selection = format_pdf_page_selection(
+                            selected_pages, count
+                        )
+                        extracted_pdf = extract_pdf_translation_data(
+                            source_data,
+                            page_selection=page_selection,
+                        )
+                        expected_content = extracted_pdf["content"]
+                        if expected_content != file_info.get("content", ""):
+                            raise DocumentFormatError(
+                                f"{file_info['name']} 的 PDF 页码选择与原文预览不一致，请重新选择页面"
+                            )
+                        file_info["pdf_page_count"] = count
+                        file_info["pdf_page_start"] = selected_pages[0]
+                        file_info["pdf_page_end"] = selected_pages[-1]
+                        file_info["pdf_page_selection"] = page_selection
+                        file_info["continuation_hints"] = extracted_pdf[
+                            "continuation_hints"
+                        ]
                 elif is_binary_document(source_format):
                     raise DocumentFormatError("文件扩展名与二进制原文格式不一致")
                 else:
