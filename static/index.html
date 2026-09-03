@@ -688,7 +688,6 @@ $('drop').addEventListener('drop', e => addFiles([...e.dataTransfer.files]));
 
 const TEXT_DOCUMENT_EXTENSIONS=['.md','.txt','.text','.markdown','.srt','.vtt'];
 const BINARY_DOCUMENT_EXTENSIONS=['.docx','.epub','.pdf'];
-const MAX_BINARY_FILE_BYTES=50*1024*1024;
 const PDF_EXTRACTION_VERSION=5;
 function pdfPageNumbers(file){
   const total=Math.max(0,Number(file?.pdf_page_count||0));
@@ -786,10 +785,6 @@ async function addFiles(list){
     const extension=fileExtension(f.name);
     if(!TEXT_DOCUMENT_EXTENSIONS.includes(extension) && !BINARY_DOCUMENT_EXTENSIONS.includes(extension)){
       await appAlert(`暂不支持“${f.name}”。\n\n当前支持 Markdown、纯文本、SRT、WebVTT、DOCX、EPUB 和带文字层的 PDF。`,'不支持的格式');
-      continue;
-    }
-    if(BINARY_DOCUMENT_EXTENSIONS.includes(extension) && f.size>MAX_BINARY_FILE_BYTES){
-      await appAlert(`“${f.name}”超过 50MB，无法导入。`,'文件过大');
       continue;
     }
     const existing = files.find(x => x.name.toLocaleLowerCase() === f.name.toLocaleLowerCase());

@@ -1836,8 +1836,6 @@ class Handler(BaseHTTPRequestHandler):
         ln = int(self.headers.get("Content-Length", 0))
         if ln <= 0:
             return {}
-        if ln > 100 * 1024 * 1024:
-            raise ValueError("请求体超过 100MB 限制")
         return json.loads(self.rfile.read(ln).decode("utf-8"))
 
     def _request_parts(self):

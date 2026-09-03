@@ -40,6 +40,13 @@ class FakeTranslator(Translator):
 
 
 class TranslationFlowTests(unittest.TestCase):
+    def test_json_request_body_has_no_fixed_byte_limit(self):
+        handler = app.Handler.__new__(app.Handler)
+        handler.headers = {"Content-Length": str(101 * 1024 * 1024)}
+        handler.rfile = io.BytesIO(b"{}")
+
+        self.assertEqual(handler._read_body(), {})
+
     def test_model_http_connection_is_closed_after_every_response(self):
         class FakeResponse:
             status = 200

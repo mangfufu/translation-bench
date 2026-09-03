@@ -22,10 +22,8 @@ class DocumentFormatError(ValueError):
 
 BINARY_EXTENSIONS = {".docx", ".epub", ".pdf"}
 PDF_EXTRACTION_VERSION = 5
-MAX_BINARY_BYTES = 50 * 1024 * 1024
 MAX_ZIP_MEMBERS = 5000
-MAX_ZIP_MEMBER_BYTES = 50 * 1024 * 1024
-MAX_ZIP_TOTAL_BYTES = 250 * 1024 * 1024
+MAX_ZIP_COMPRESSION_RATIO = 1000.0
 MAX_PDF_PAGES = 1000
 MAX_PDF_TEXT_CHARS = 20 * 1024 * 1024
 MAX_PDF_PAGE_CONTENT_BYTES = 16 * 1024 * 1024
@@ -78,8 +76,8 @@ def _read_zip_member(archive, name):
 def _validated_zip(data, expected_extension):
     if not isinstance(data, (bytes, bytearray)):
         raise DocumentFormatError("文档数据无效")
-    if not data or len(data) > MAX_BINARY_BYTES:
-        raise DocumentFormatError("文档为空或超过 50MB 限制")
+    if not data:
+        raise DocumentFormatError("文档为空")
     try:
         archive = zipfile.ZipFile(io.BytesIO(data), "r")
         members = archive.infolist()
@@ -88,18 +86,17 @@ def _validated_zip(data, expected_extension):
     if len(members) > MAX_ZIP_MEMBERS:
         archive.close()
         raise DocumentFormatError("文档内部文件数量过多")
-    total = 0
     for member in members:
         if member.flag_bits & 0x1:
             archive.close()
             raise DocumentFormatError("暂不支持加密文档")
-        if member.file_size > MAX_ZIP_MEMBER_BYTES:
+        compressed_size = max(1, int(member.compress_size or 0))
+        if (
+            member.file_size >= 1024 * 1024
+            and member.file_size / compressed_size > MAX_ZIP_COMPRESSION_RATIO
+        ):
             archive.close()
-            raise DocumentFormatError("文档内部存在过大的文件")
-        total += member.file_size
-        if total > MAX_ZIP_TOTAL_BYTES:
-            archive.close()
-            raise DocumentFormatError("文档解压后超过 250MB 限制")
+            raise DocumentFormatError("文档内部存在异常压缩比，可能是压缩炸弹")
     member_names = archive.namelist()
     names = set(member_names)
     if len(names) != len(member_names):
@@ -120,23 +117,15 @@ def _validated_zip(data, expected_extension):
 
     # 导入时读遍所有成员，让 CRC 错误、不支持的压缩算法和
     # 伪造解压大小在翻译前就失败，不要等到回写容器时才发现。
-    actual_total = 0
     try:
         for member in members:
             if member.is_dir():
                 continue
-            member_total = 0
             with archive.open(member, "r") as source:
                 while True:
                     chunk = source.read(1024 * 1024)
                     if not chunk:
                         break
-                    member_total += len(chunk)
-                    actual_total += len(chunk)
-                    if member_total > MAX_ZIP_MEMBER_BYTES:
-                        raise DocumentFormatError("文档内部存在过大的文件")
-                    if actual_total > MAX_ZIP_TOTAL_BYTES:
-                        raise DocumentFormatError("文档解压后超过 250MB 限制")
     except DocumentFormatError:
         archive.close()
         raise
@@ -595,8 +584,8 @@ def _pdf_reader(data):
     """校验 PDF 容器；密码文件必须由用户先解密。"""
     if not isinstance(data, (bytes, bytearray)):
         raise DocumentFormatError("PDF 数据无效")
-    if not data or len(data) > MAX_BINARY_BYTES:
-        raise DocumentFormatError("PDF 为空或超过 50MB 限制")
+    if not data:
+        raise DocumentFormatError("PDF 为空")
     try:
         from pypdf import PdfReader
     except ImportError as exc:
@@ -632,7 +621,6 @@ def _pdf_decode_limits():
         "JBIG2_MAX_OUTPUT_LENGTH",
         "ZLIB_MAX_OUTPUT_LENGTH",
         "LZW_MAX_OUTPUT_LENGTH",
-        "MAX_DECLARED_STREAM_LENGTH",
         "RUN_LENGTH_MAX_OUTPUT_LENGTH",
         "MAX_ARRAY_BASED_STREAM_OUTPUT_LENGTH",
     )
@@ -642,14 +630,9 @@ def _pdf_decode_limits():
             continue
         value = getattr(pdf_filters, name)
         previous[name] = value
-        # /Length 是压缩前容器中的原始流长度；大型封面图片可能合法地
-        # 超过 16MB。这里只允许到整个输入文件上限，实际解压输出仍受
-        # 单页 16MB 限制，避免把正常图片误判成解压炸弹。
-        hard_limit = (
-            MAX_BINARY_BYTES + 1
-            if name == "MAX_DECLARED_STREAM_LENGTH"
-            else MAX_PDF_PAGE_CONTENT_BYTES + 1
-        )
+        # 这里只限制实际解码输出，不再按输入文件大小限制合法的大型
+        # 图片或流声明；页面内容流仍会在提取前后接受独立安全检查。
+        hard_limit = MAX_PDF_PAGE_CONTENT_BYTES + 1
         if not isinstance(value, int) or value <= 0 or value > hard_limit:
             setattr(pdf_filters, name, hard_limit)
     try:
@@ -2939,11 +2922,9 @@ def load_binary_source(cache_dir, source_id, expected_format="", expected_sha256
     path = os.path.join(cache_dir, safe_id)
     try:
         with open(path, "rb") as handle:
-            data = handle.read(MAX_BINARY_BYTES + 1)
+            data = handle.read()
     except FileNotFoundError as exc:
         raise DocumentFormatError("二进制原文缓存不存在，请重新添加文件") from exc
-    if len(data) > MAX_BINARY_BYTES:
-        raise DocumentFormatError("二进制原文缓存超过 50MB 限制")
     digest = binary_digest(data)
     if expected_sha256 and digest != expected_sha256:
         raise DocumentFormatError("二进制原文缓存校验失败，请重新添加文件")

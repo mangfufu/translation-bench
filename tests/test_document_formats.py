@@ -901,22 +901,23 @@ class DocumentFormatTests(unittest.TestCase):
             "FLATE_MAX_BUFFER_SIZE",
             "JBIG2_MAX_OUTPUT_LENGTH",
             "LZW_MAX_OUTPUT_LENGTH",
-            "MAX_DECLARED_STREAM_LENGTH",
             "RUN_LENGTH_MAX_OUTPUT_LENGTH",
             "ZLIB_MAX_OUTPUT_LENGTH",
         )
         previous = {name: getattr(pdf_filters, name) for name in names}
+        declared_stream_limit = getattr(
+            pdf_filters, "MAX_DECLARED_STREAM_LENGTH", None
+        )
         with document_formats._pdf_decode_limits():
             for name in names:
-                expected_limit = (
-                    document_formats.MAX_BINARY_BYTES + 1
-                    if name == "MAX_DECLARED_STREAM_LENGTH"
-                    else document_formats.MAX_PDF_PAGE_CONTENT_BYTES + 1
-                )
                 self.assertLessEqual(
                     getattr(pdf_filters, name),
-                    expected_limit,
+                    document_formats.MAX_PDF_PAGE_CONTENT_BYTES + 1,
                 )
+            self.assertEqual(
+                getattr(pdf_filters, "MAX_DECLARED_STREAM_LENGTH", None),
+                declared_stream_limit,
+            )
         self.assertEqual(
             {name: getattr(pdf_filters, name) for name in names},
             previous,
