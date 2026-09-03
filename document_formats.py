@@ -1086,50 +1086,453 @@ def _pdf_wrap_line(text, font_name, font_size, width, pdfmetrics):
     return lines
 
 
-def _build_pdf(data, translated_text, document_title="", target_language=""):
-    pages = _pdf_document_units(data)
-    translations = str(translated_text).split("\n")
-    source_units = [unit for page in pages for unit in page["units"]]
-    if len(translations) < len(source_units):
-        raise DocumentFormatError("译文单元数量少于 PDF 原文单元")
-    if len(translations) > len(source_units):
-        raise DocumentFormatError("译文单元数量多于 PDF 原文单元")
-    try:
-        from reportlab.pdfbase import pdfmetrics
-        from reportlab.pdfgen import canvas
-        from reportlab.pdfgen.textobject import rtlSupport
-    except ImportError as exc:
-        raise DocumentFormatError(
-            "PDF 输出支持尚未安装，请先运行: py -3 -m pip install -r requirements.txt"
-        ) from exc
+class _PDFLayoutFallback(Exception):
+    """原位替换无法被严格验证时，内部切换到重排版。"""
 
-    joined = "\n".join(translations)
-    has_rtl = any(
-        _pdf_line_direction(translation, target_language) == "RTL"
-        for translation in translations
+
+_PDF_TEXT_SHOW_OPERATORS = {b"Tj", b"TJ", b"'", b'"'}
+
+
+def _pdf_matrix_multiply(left, right):
+    """合并 PDF 的文本矩阵与当前变换矩阵。"""
+    return (
+        left[0] * right[0] + left[1] * right[2],
+        left[0] * right[1] + left[1] * right[3],
+        left[2] * right[0] + left[3] * right[2],
+        left[2] * right[1] + left[3] * right[3],
+        left[4] * right[0] + left[5] * right[2] + right[4],
+        left[4] * right[1] + left[5] * right[3] + right[5],
     )
-    shaping = _pdf_contains_shaping_script(joined)
-    if has_rtl and not rtlSupport:
-        raise DocumentFormatError(
-            "当前 ReportLab 环境缺少 RTL 排版组件，暂不能生成阿拉伯文或希伯来文 PDF"
-        )
-    if shaping:
+
+
+def _pdf_layout_key(text):
+    value = _normal_text(str(text or "").replace("\u00ad", ""))
+    return "".join(character for character in value if not character.isspace())
+
+
+def _pdf_join_fragment_text(fragments):
+    combined = ""
+    for fragment in fragments:
+        value = fragment["text"]
+        if combined.endswith("-") and value[:1].isalnum():
+            combined = combined[:-1] + value
+        elif combined:
+            combined += " " + value
+        else:
+            combined = value
+    return _normal_text(combined)
+
+
+def _pdf_positioned_fragments(page, width, height):
+    fragments = []
+    fill_color = [0.0, 0.0, 0.0]
+    color_stack = []
+
+    def operand_before(operator, operands, _cm_matrix, _tm_matrix):
+        nonlocal fill_color
         try:
-            import uharfbuzz  # noqa: F401
-        except ImportError as exc:
-            raise DocumentFormatError(
-                "当前译文需要复杂文字塑形；请安装 uharfbuzz 后再生成 PDF"
-            ) from exc
+            if operator == b"Tr" and operands and int(operands[0]) != 0:
+                # 描边、隐形或裁剪文字可能是 OCR/特效层，不能当作
+                # 普通可见文字直接覆盖。
+                raise _PDFLayoutFallback
+            if operator == b"Ts" and operands and abs(float(operands[0])) > 0.01:
+                # 上下标的视觉坐标不能由 visitor 矩阵稳定还原。
+                raise _PDFLayoutFallback
+            if operator == b"q":
+                color_stack.append(tuple(fill_color))
+            elif operator == b"Q":
+                fill_color = list(color_stack.pop()) if color_stack else [0.0, 0.0, 0.0]
+            elif operator == b"g" and operands:
+                gray = min(1.0, max(0.0, float(operands[0])))
+                fill_color = [gray, gray, gray]
+            elif operator == b"rg" and len(operands) >= 3:
+                fill_color = [
+                    min(1.0, max(0.0, float(component)))
+                    for component in operands[:3]
+                ]
+            elif operator == b"k" and len(operands) >= 4:
+                cyan, magenta, yellow, black = (
+                    min(1.0, max(0.0, float(component)))
+                    for component in operands[:4]
+                )
+                fill_color = [
+                    1.0 - min(1.0, cyan + black),
+                    1.0 - min(1.0, magenta + black),
+                    1.0 - min(1.0, yellow + black),
+                ]
+        except _PDFLayoutFallback:
+            raise
+        except (TypeError, ValueError, IndexError, OverflowError):
+            # 颜色指令不标准时仍可以依靠默认黑色输出，不影响定位安全性。
+            fill_color = [0.0, 0.0, 0.0]
 
-    font_name = _pdf_output_font(joined, target_language)
-    output = io.BytesIO()
-    initial_size = pages[0]["size"]
-    pdf = canvas.Canvas(
-        output,
-        pagesize=initial_size,
-        pageCompression=1,
-        invariant=1,
+    def visit(text, cm_matrix, tm_matrix, _font, font_size):
+        value = _normal_text(str(text or "").replace("\x00", ""))
+        if not value:
+            return
+        try:
+            matrix = _pdf_matrix_multiply(tm_matrix, cm_matrix)
+            x, y = float(matrix[4]), float(matrix[5])
+            x_scale = (float(matrix[0]) ** 2 + float(matrix[1]) ** 2) ** 0.5
+            y_scale = (float(matrix[2]) ** 2 + float(matrix[3]) ** 2) ** 0.5
+            size = abs(float(font_size)) * max(y_scale, 0.01)
+        except (TypeError, ValueError, IndexError, OverflowError) as exc:
+            raise _PDFLayoutFallback from exc
+        # 仅对水平、未镜像的文字做原位替换。旋转或斜切文字交给重排版，
+        # 以免看似成功却实际覆盖错位。
+        tolerance = max(x_scale, y_scale, 1.0) * 1e-4
+        if (
+            matrix[0] <= 0
+            or matrix[3] <= 0
+            or abs(matrix[1]) > tolerance
+            or abs(matrix[2]) > tolerance
+            or not (0.0 <= x <= width and -size <= y <= height + size)
+            or not (0.5 <= size <= 200.0)
+        ):
+            raise _PDFLayoutFallback
+        fragments.append({
+            "text": value,
+            "x": x,
+            "y": y,
+            "size": size,
+            "color": tuple(fill_color),
+        })
+
+    try:
+        page.extract_text(visitor_operand_before=operand_before, visitor_text=visit)
+    except _PDFLayoutFallback:
+        raise
+    except Exception as exc:
+        raise _PDFLayoutFallback from exc
+    return fragments
+
+
+def _pdf_map_positioned_units(page, page_units, width, height):
+    fragments = _pdf_positioned_fragments(page, width, height)
+    mapped = []
+    cursor = 0
+    for unit in page_units:
+        target = _pdf_layout_key(unit["text"])
+        group = []
+        candidate = ""
+        while cursor < len(fragments):
+            group.append(fragments[cursor])
+            cursor += 1
+            candidate = _pdf_layout_key(_pdf_join_fragment_text(group))
+            if candidate == target:
+                break
+            if not target.startswith(candidate):
+                raise _PDFLayoutFallback
+        if not target or candidate != target:
+            raise _PDFLayoutFallback
+        mapped.append({"unit": unit, "fragments": group})
+    if cursor != len(fragments):
+        raise _PDFLayoutFallback
+    return mapped
+
+
+def _pdf_direct_object(value):
+    try:
+        return value.get_object()
+    except AttributeError:
+        return value
+
+
+def _pdf_object_identity(value):
+    reference = getattr(value, "indirect_reference", None)
+    if reference is None and hasattr(value, "idnum"):
+        reference = value
+    if reference is not None and hasattr(reference, "idnum"):
+        return (int(reference.idnum), int(getattr(reference, "generation", 0)))
+    return ("direct", id(value))
+
+
+def _pdf_stream_contains_text(stream, pdf):
+    try:
+        from pypdf.generic import ContentStream
+
+        parsed = ContentStream(stream, pdf)
+        return any(operator in _PDF_TEXT_SHOW_OPERATORS for _, operator in parsed.operations)
+    except Exception as exc:
+        raise _PDFLayoutFallback from exc
+
+
+def _pdf_resources_contain_external_text(resources, pdf, seen):
+    resources = _pdf_direct_object(resources)
+    if not resources:
+        return False
+    for resource_name in ("/XObject", "/Pattern"):
+        collection = _pdf_direct_object(resources.get(resource_name))
+        if not collection:
+            continue
+        for reference in collection.values():
+            identity = _pdf_object_identity(reference)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            item = _pdf_direct_object(reference)
+            if not hasattr(item, "get_data"):
+                continue
+            subtype = str(item.get("/Subtype", ""))
+            if resource_name == "/XObject" and subtype != "/Form":
+                continue
+            if _pdf_stream_contains_text(item, pdf):
+                return True
+            if _pdf_resources_contain_external_text(item.get("/Resources"), pdf, seen):
+                return True
+    return False
+
+
+def _pdf_appearance_contains_text(value, pdf, seen):
+    identity = _pdf_object_identity(value)
+    if identity in seen:
+        return False
+    seen.add(identity)
+    item = _pdf_direct_object(value)
+    if hasattr(item, "get_data"):
+        if _pdf_stream_contains_text(item, pdf):
+            return True
+        return _pdf_resources_contain_external_text(item.get("/Resources"), pdf, seen)
+    if hasattr(item, "values"):
+        return any(
+            _pdf_appearance_contains_text(child, pdf, seen)
+            for child in item.values()
+        )
+    return False
+
+
+def _pdf_page_has_external_text(page):
+    pdf = getattr(page, "pdf", None)
+    seen = set()
+    if _pdf_resources_contain_external_text(page.get("/Resources"), pdf, seen):
+        return True
+    annotations = _pdf_direct_object(page.get("/Annots")) or []
+    for reference in annotations:
+        annotation = _pdf_direct_object(reference)
+        appearance = annotation.get("/AP") if hasattr(annotation, "get") else None
+        if appearance and _pdf_appearance_contains_text(appearance, pdf, seen):
+            return True
+    return False
+
+
+def _pdf_page_origin_is_supported(page):
+    try:
+        media = page.mediabox
+        crop = page.cropbox
+        values = (
+            float(media.left), float(media.bottom), float(crop.left), float(crop.bottom)
+        )
+        boxes_equal = all(
+            abs(float(a) - float(b)) <= 0.01
+            for a, b in zip(
+                (media.left, media.bottom, media.right, media.top),
+                (crop.left, crop.bottom, crop.right, crop.top),
+            )
+        )
+        rotation = int(page.get("/Rotate", 0) or 0) % 360
+        user_unit = float(page.get("/UserUnit", 1) or 1)
+    except (TypeError, ValueError, AttributeError):
+        return False
+    return (
+        rotation == 0
+        and abs(user_unit - 1.0) <= 0.001
+        and boxes_equal
+        and all(abs(value) <= 0.01 for value in values)
     )
+
+
+def _pdf_unit_boxes(mapped, width, height):
+    boxes = []
+    margin = max(18.0, min(72.0, width * 0.08, height * 0.08))
+    for entry in mapped:
+        fragments = entry["fragments"]
+        sizes = sorted(fragment["size"] for fragment in fragments)
+        preferred = sizes[len(sizes) // 2]
+        boxes.append({
+            "entry": entry,
+            "left": min(fragment["x"] for fragment in fragments),
+            "right": width - margin,
+            "top": max(
+                fragment["y"] + fragment["size"] * 0.9
+                for fragment in fragments
+            ),
+            "bottom": min(
+                fragment["y"] - fragment["size"] * 0.35
+                for fragment in fragments
+            ),
+            "font_size": min(36.0, max(5.5, preferred)),
+            "color": tuple(fragments[0]["color"]),
+        })
+
+    # 同一视觉行中的多个单元（常见于表格）以右侧单元作为边界。
+    for box in boxes:
+        candidates = []
+        for other in boxes:
+            if other is box or other["left"] <= box["left"] + 1.0:
+                continue
+            row_tolerance = max(
+                2.0, max(box["font_size"], other["font_size"]) * 0.35
+            )
+            if abs(other["top"] - box["top"]) <= row_tolerance:
+                candidates.append(other["left"])
+        if candidates:
+            box["right"] = min(box["right"], min(candidates) - 4.0)
+        if (
+            box["left"] < 0
+            or box["right"] > width + 0.01
+            or box["bottom"] < 0
+            or box["top"] > height + 0.01
+            or box["right"] - box["left"] < 18.0
+            or box["top"] - box["bottom"] < 4.0
+        ):
+            raise _PDFLayoutFallback
+    return boxes
+
+
+def _pdf_fit_translation(text, box, font_name, pdfmetrics):
+    width = box["right"] - box["left"]
+    height = box["top"] - box["bottom"]
+    preferred = box["font_size"]
+    minimum = max(5.5, preferred * 0.55)
+    size = preferred
+    while size + 1e-6 >= minimum:
+        lines = _pdf_wrap_line(text, font_name, size, width, pdfmetrics)
+        leading = size * 1.2
+        required = size * 1.15 + max(0, len(lines) - 1) * leading
+        if required <= height + 0.01:
+            return size, leading, lines
+        size -= 0.25
+    raise _PDFLayoutFallback
+
+
+def _pdf_strip_page_text(page):
+    try:
+        contents = page.get_contents()
+        if contents is None:
+            return
+        contents.operations = [
+            (operands, operator)
+            for operands, operator in contents.operations
+            if operator not in _PDF_TEXT_SHOW_OPERATORS
+        ]
+        page.replace_contents(contents)
+    except Exception as exc:
+        raise _PDFLayoutFallback from exc
+
+
+def _build_pdf_layout_preserving(
+    data,
+    pages,
+    translations,
+    font_name,
+    pdfmetrics,
+    canvas,
+    document_title,
+    target_language,
+):
+    try:
+        from pypdf import PdfReader, PdfWriter
+    except ImportError as exc:
+        raise _PDFLayoutFallback from exc
+
+    with _pdf_decode_limits():
+        reader = _pdf_reader(data)
+        if len(reader.pages) != len(pages):
+            raise _PDFLayoutFallback
+        overlay_bytes = io.BytesIO()
+        overlay = canvas.Canvas(
+            overlay_bytes,
+            pagesize=pages[0]["size"],
+            pageCompression=1,
+            invariant=1,
+        )
+        plans = []
+        translation_index = 0
+        for page_index, source_page in enumerate(reader.pages):
+            width, height = pages[page_index]["size"]
+            if not _pdf_page_origin_is_supported(source_page):
+                raise _PDFLayoutFallback
+            if _pdf_page_has_external_text(source_page):
+                raise _PDFLayoutFallback
+            mapped = _pdf_map_positioned_units(
+                source_page, pages[page_index]["units"], width, height
+            )
+            boxes = _pdf_unit_boxes(mapped, width, height)
+            page_plan = []
+            for box in boxes:
+                translation = translations[translation_index]
+                translation_index += 1
+                size, leading, lines = _pdf_fit_translation(
+                    translation, box, font_name, pdfmetrics
+                )
+                page_plan.append((box, size, leading, lines))
+            plans.append(page_plan)
+
+        # 先完成全文匹配和容量验证，再生成覆盖层，保证不会产生半成品。
+        for page_index, page_plan in enumerate(plans):
+            if page_index:
+                overlay.showPage()
+            width, height = pages[page_index]["size"]
+            overlay.setPageSize((width, height))
+            for box, size, leading, lines in page_plan:
+                overlay.setFont(font_name, size)
+                overlay.setFillColorRGB(*box["color"])
+                baseline = box["top"] - size * 0.9
+                for line_index, line in enumerate(lines):
+                    y = baseline - line_index * leading
+                    direction = _pdf_line_direction(line, target_language)
+                    shaping = _pdf_contains_shaping_script(line)
+                    if direction == "RTL":
+                        overlay.drawRightString(
+                            box["right"], y, line,
+                            direction="RTL", shaping=shaping,
+                        )
+                    else:
+                        overlay.drawString(
+                            box["left"], y, line,
+                            direction="LTR", shaping=shaping,
+                        )
+        overlay.save()
+
+        overlay_reader = PdfReader(io.BytesIO(overlay_bytes.getvalue()))
+        if len(overlay_reader.pages) != len(reader.pages):
+            raise _PDFLayoutFallback
+        writer = PdfWriter()
+        for page_index, source_page in enumerate(reader.pages):
+            output_page = writer.add_page(source_page)
+            _pdf_strip_page_text(output_page)
+            output_page.merge_page(overlay_reader.pages[page_index], over=True)
+        writer.metadata = {
+            "/Title": str(document_title or "Translated document"),
+            "/Author": "",
+            "/Creator": "Translation Bench",
+            "/Subject": "Layout-preserving translation generated from a text-layer PDF",
+        }
+        output = io.BytesIO()
+        writer.write(output)
+        return output.getvalue()
+
+
+def _build_pdf_reflow(
+    pages,
+    translations,
+    font_name,
+    pdfmetrics,
+    canvas,
+    document_title,
+    target_language,
+):
+    try:
+        output = io.BytesIO()
+        initial_size = pages[0]["size"]
+        pdf = canvas.Canvas(
+            output,
+            pagesize=initial_size,
+            pageCompression=1,
+            invariant=1,
+        )
+    except Exception as exc:
+        raise DocumentFormatError("无法初始化 PDF 输出") from exc
     pdf.setCreator("Translation Bench")
     pdf.setAuthor("")
     pdf.setTitle(str(document_title or "Translated document"))
@@ -1181,6 +1584,77 @@ def _build_pdf(data, translated_text, document_title="", target_language=""):
             y -= 8.0 if unit["heading"] else 6.0
     pdf.save()
     return output.getvalue()
+
+
+def _build_pdf(data, translated_text, document_title="", target_language=""):
+    pages = _pdf_document_units(data)
+    translations = str(translated_text).split("\n")
+    source_units = [unit for page in pages for unit in page["units"]]
+    if len(translations) < len(source_units):
+        raise DocumentFormatError("译文单元数量少于 PDF 原文单元")
+    if len(translations) > len(source_units):
+        raise DocumentFormatError("译文单元数量多于 PDF 原文单元")
+    try:
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfgen import canvas
+        from reportlab.pdfgen.textobject import rtlSupport
+    except ImportError as exc:
+        raise DocumentFormatError(
+            "PDF 输出支持尚未安装，请先运行: py -3 -m pip install -r requirements.txt"
+        ) from exc
+
+    joined = "\n".join(translations)
+    has_rtl = any(
+        _pdf_line_direction(translation, target_language) == "RTL"
+        for translation in translations
+    )
+    shaping = _pdf_contains_shaping_script(joined)
+    if has_rtl and not rtlSupport:
+        raise DocumentFormatError(
+            "当前 ReportLab 环境缺少 RTL 排版组件，暂不能生成阿拉伯文或希伯来文 PDF"
+        )
+    if shaping:
+        try:
+            import uharfbuzz  # noqa: F401
+        except ImportError as exc:
+            raise DocumentFormatError(
+                "当前译文需要复杂文字塑形；请安装 uharfbuzz 后再生成 PDF"
+            ) from exc
+
+    font_name = _pdf_output_font(joined, target_language)
+    try:
+        return _build_pdf_layout_preserving(
+            data,
+            pages,
+            translations,
+            font_name,
+            pdfmetrics,
+            canvas,
+            document_title,
+            target_language,
+        )
+    except _PDFLayoutFallback:
+        return _build_pdf_reflow(
+            pages,
+            translations,
+            font_name,
+            pdfmetrics,
+            canvas,
+            document_title,
+            target_language,
+        )
+    except DocumentFormatError:
+        raise
+    except Exception:
+        return _build_pdf_reflow(
+            pages,
+            translations,
+            font_name,
+            pdfmetrics,
+            canvas,
+            document_title,
+            target_language,
+        )
 
 
 def extract_binary_text(document_format, data):

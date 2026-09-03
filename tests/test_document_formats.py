@@ -435,9 +435,9 @@ def make_pdf(text_layer=True, encrypted=False):
         line("- Confirm that every extracted item remains a separate translation unit.", 680)
         line("- Keep URLs, numbers, version strings, and placeholders unchanged.", 655)
         line("- Preserve page order even when translated text grows longer.", 630)
-        line("The source includes a compact table-like region below. PDF files do", 585)
-        line("not carry reliable table semantics, so the output intentionally reflows", 570)
-        line("the extracted text instead of pretending to preserve cell geometry.", 555)
+        line("The source includes a compact table-like region below. The translator", 585)
+        line("should preserve these vector cell borders when coordinate mapping is safe,", 570)
+        line("and use a clean reflow only when the translated text cannot fit.", 555)
         pdf.setStrokeColor(HexColor("#5B6773"))
         for x in (72, 210, 360, 540):
             pdf.line(x, 365, x, 505)
@@ -455,8 +455,8 @@ def make_pdf(text_layer=True, encrypted=False):
         line("Drift", 379, 9, 82)
         line("timing deviation", 379, 9, 220)
         line("do not summarize", 379, 9, 370)
-        line("A vector diagram is present only to verify that non-text artwork does", 325)
-        line("not prevent text-layer extraction.", 310)
+        line("A vector diagram is present to verify that non-text artwork survives", 325)
+        line("the layout-preserving translation path.", 310)
         pdf.setStrokeColor(HexColor("#243447"))
         pdf.circle(175, 210, 46, fill=0, stroke=1)
         pdf.line(221, 210, 410, 210)
@@ -650,8 +650,9 @@ class DocumentFormatTests(unittest.TestCase):
             self.assertIn("<em", chapter)
             self.assertIn("<strong", chapter)
 
-    def test_pdf_text_layer_extracts_and_builds_reflowed_translation(self):
+    def test_pdf_text_layer_extracts_and_preserves_safe_layout(self):
         from pypdf import PdfReader
+        from pypdf.generic import ContentStream
 
         source = make_pdf()
         extracted = extract_binary_text("pdf", source)
@@ -675,9 +676,46 @@ class DocumentFormatTests(unittest.TestCase):
             target_language="英文",
         )
         reader = PdfReader(io.BytesIO(translated))
-        self.assertGreaterEqual(len(reader.pages), 3)
+        source_reader = PdfReader(io.BytesIO(source))
+        self.assertEqual(len(reader.pages), 3)
         self.assertEqual(reader.metadata.title, "sample.en.pdf")
+        self.assertEqual(
+            reader.metadata.subject,
+            "Layout-preserving translation generated from a text-layer PDF",
+        )
+        for source_page, translated_page in zip(source_reader.pages, reader.pages):
+            self.assertEqual(source_page.mediabox, translated_page.mediabox)
+            self.assertEqual(
+                int(source_page.get("/Rotate", 0) or 0),
+                int(translated_page.get("/Rotate", 0) or 0),
+            )
+
+        visible = "".join(page.extract_text() or "" for page in reader.pages)
+        self.assertNotIn("The Glass Meridian", visible)
         self.assertEqual(extract_binary_text("pdf", translated), translated_text)
+
+        # 表格和示意图的矢量线条保留，只移除原始文字显示指令。
+        source_ops = ContentStream(
+            source_reader.pages[1].get_contents(), source_reader
+        ).operations
+        translated_ops = ContentStream(
+            reader.pages[1].get_contents(), reader
+        ).operations
+        source_lines = sum(operator == b"l" for _, operator in source_ops)
+        translated_lines = sum(operator == b"l" for _, operator in translated_ops)
+        self.assertGreaterEqual(source_lines, 10)
+        self.assertGreaterEqual(translated_lines, source_lines)
+
+        coordinates = []
+
+        def capture(text, _cm, tm, _font, _size):
+            if "Stable translated unit 001." in str(text or ""):
+                coordinates.append((float(tm[4]), float(tm[5])))
+
+        reader.pages[0].extract_text(visitor_text=capture)
+        self.assertTrue(coordinates)
+        self.assertAlmostEqual(coordinates[0][0], 72.0, delta=1.0)
+        self.assertAlmostEqual(coordinates[0][1], 720.0, delta=2.0)
 
     def test_pdf_cjk_output_embeds_a_covering_system_font(self):
         source = make_pdf()
@@ -804,8 +842,117 @@ class DocumentFormatTests(unittest.TestCase):
         visible = "".join(page.extract_text() or "" for page in reader.pages)
 
         self.assertGreater(len(reader.pages), 3)
+        self.assertEqual(
+            reader.metadata.subject,
+            "Reflowed translation generated from a text-layer PDF",
+        )
         self.assertIn("END MARKER.", visible)
         self.assertIn("Normal translation 32.", visible)
+
+    def test_pdf_form_text_uses_safe_reflow_fallback(self):
+        from reportlab.pdfgen.canvas import Canvas
+        from pypdf import PdfReader
+
+        source_buffer = io.BytesIO()
+        pdf = Canvas(source_buffer, invariant=1)
+        pdf.setFont("Helvetica", 12)
+        pdf.drawString(72, 720, "Direct page text.")
+        pdf.beginForm("label")
+        pdf.setFont("Helvetica", 12)
+        pdf.drawString(0, 0, "Text inside a form object.")
+        pdf.endForm()
+        pdf.doForm("label")
+        pdf.save()
+
+        output = build_binary_output(
+            "pdf",
+            source_buffer.getvalue(),
+            "Translated direct text.",
+            target_language="英文",
+        )
+        reader = PdfReader(io.BytesIO(output))
+        self.assertEqual(
+            reader.metadata.subject,
+            "Reflowed translation generated from a text-layer PDF",
+        )
+        visible = "".join(page.extract_text() or "" for page in reader.pages)
+        self.assertEqual(visible.strip(), "Translated direct text.")
+        self.assertNotIn("form object", visible)
+
+    def test_pdf_invisible_ocr_text_uses_safe_reflow_fallback(self):
+        from reportlab.pdfgen.canvas import Canvas
+        from pypdf import PdfReader
+
+        source_buffer = io.BytesIO()
+        pdf = Canvas(source_buffer, invariant=1)
+        text = pdf.beginText(72, 720)
+        text.setFont("Helvetica", 12)
+        text.setTextRenderMode(3)
+        text.textLine("Invisible OCR text.")
+        pdf.drawText(text)
+        pdf.save()
+
+        self.assertEqual(
+            extract_binary_text("pdf", source_buffer.getvalue()),
+            "Invisible OCR text.",
+        )
+        output = build_binary_output(
+            "pdf",
+            source_buffer.getvalue(),
+            "Visible translated text.",
+            target_language="英文",
+        )
+        reader = PdfReader(io.BytesIO(output))
+        self.assertEqual(
+            reader.metadata.subject,
+            "Reflowed translation generated from a text-layer PDF",
+        )
+        self.assertEqual(reader.pages[0].extract_text().strip(), "Visible translated text.")
+
+    def test_pdf_safe_layout_preserves_images_and_links(self):
+        from PIL import Image
+        from reportlab.lib.utils import ImageReader
+        from reportlab.pdfgen.canvas import Canvas
+        from pypdf import PdfReader
+
+        image_buffer = io.BytesIO()
+        Image.new("RGB", (8, 8), (38, 106, 178)).save(image_buffer, format="PNG")
+        image_buffer.seek(0)
+
+        source_buffer = io.BytesIO()
+        pdf = Canvas(source_buffer, invariant=1)
+        pdf.setFont("Helvetica", 12)
+        pdf.drawString(72, 720, "Text above a preserved image and link.")
+        pdf.drawImage(ImageReader(image_buffer), 72, 560, width=120, height=90)
+        pdf.linkURL("https://example.com/preserved", (72, 700, 300, 735))
+        pdf.save()
+
+        output = build_binary_output(
+            "pdf",
+            source_buffer.getvalue(),
+            "图片和链接上方的译文。",
+            target_language="中文",
+        )
+        reader = PdfReader(io.BytesIO(output))
+        page = reader.pages[0]
+        self.assertEqual(
+            reader.metadata.subject,
+            "Layout-preserving translation generated from a text-layer PDF",
+        )
+        resources = page["/Resources"].get_object()
+        xobjects = resources["/XObject"].get_object()
+        images = [
+            reference.get_object()
+            for reference in xobjects.values()
+            if str(reference.get_object().get("/Subtype", "")) == "/Image"
+        ]
+        self.assertEqual(len(images), 1)
+        annotations = page["/Annots"].get_object()
+        uris = [
+            str(annotation.get_object()["/A"].get_object().get("/URI", ""))
+            for annotation in annotations
+        ]
+        self.assertIn("https://example.com/preserved", uris)
 
     def test_pdf_output_preview_uses_stable_state_units(self):
         source = make_pdf()
